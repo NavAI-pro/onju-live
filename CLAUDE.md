@@ -8,6 +8,8 @@ Onju Voice v2 (OnjuClaw) — a server pipeline plus ESP32 firmware that turns a 
 
 Read `README.md` for protocol details and `pipeline/config.yaml.example` for every tunable. See also `m5_echo/README.md` for the M5 Echo target's quirks (PDM mic, no PSRAM, I2S TX/RX switching).
 
+**Setting it up from scratch?** Don't re-derive the install/flash sequence from this file — follow [`STEPS.md`](STEPS.md) top-to-bottom. It captures the exact macOS toolchain order (Rosetta → arduino-cli → ESP32 core), the 2.4 GHz Wi-Fi constraint, the multicast-doesn't-bridge-bands workaround (`POST /devices`), the voice_id-as-query-param TTS quirk, and the other gotchas that took real time to debug. Update STEPS.md whenever the setup path changes.
+
 ## Common commands
 
 ```bash
