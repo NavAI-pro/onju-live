@@ -17,6 +17,7 @@ dependencies = [
     "scipy",
     "silero-vad",
     "pyserial",
+    "google-genai",
 ]
 
 [project.urls]

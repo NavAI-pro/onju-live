@@ -52,6 +52,61 @@ async def send_stop_listening(ip: str, port: int, hold_s: int = 0):
     await send_tcp(ip, port, header, timeout=0.2)
 
 
+async def open_audio_stream(ip: str, port: int, mic_timeout: int = 60, volume: int = 14,
+                             fade: int = 6, timeout: float = 2.0) -> asyncio.StreamWriter | None:
+    """Open a persistent TCP audio stream — writes a 0xAA header then leaves the
+    socket open so the caller can stream length-prefixed Opus frames over a
+    single continuous stream. Avoids the per-chunk decoder warm-up artefacts
+    the device hears as clicks when each chunk is its own short TCP+Opus stream."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        header = bytes([
+            0xAA,
+            (mic_timeout >> 8) & 0xFF,
+            mic_timeout & 0xFF,
+            volume,
+            fade,
+            2,  # Opus
+        ])
+        writer.write(header)
+        await writer.drain()
+        return writer
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        return None
+
+
+async def write_opus_frames_stream(writer: asyncio.StreamWriter, frames: list[bytes]) -> bool:
+    """Write length-prefixed Opus frames to a persistent stream. False if dropped."""
+    if writer is None:
+        return False
+    try:
+        for frame in frames:
+            writer.write(struct.pack('>H', len(frame)))
+            writer.write(frame)
+        await writer.drain()
+        return True
+    except (ConnectionError, OSError):
+        return False
+
+
+async def close_audio_stream(writer: asyncio.StreamWriter) -> None:
+    """Send zero-length end-of-speech marker and close cleanly."""
+    if writer is None:
+        return
+    try:
+        writer.write(struct.pack('>H', 0))
+        await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
+
+
 async def open_led_connection(ip: str, port: int, timeout: float = 1) -> asyncio.StreamWriter | None:
     """Open a persistent TCP connection for streaming LED blink commands."""
     try:

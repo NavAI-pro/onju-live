@@ -2,7 +2,21 @@ asr:
   url: "http://localhost:8100"               # parakeet-asr-server
 
 conversation:
-  backend: "agentic"                           # "agentic" (e.g. OpenClaw, with tools) or "conversational" (plain chat)
+  backend: "agentic"                           # "agentic" (e.g. OpenClaw, with tools) | "conversational" (plain chat) | "gemini_live" (end-to-end audio, no ASR/TTS)
+
+  gemini_live:
+    # Bidirectional audio with Gemini Live. ASR + TTS are bypassed — the
+    # device's PCM goes straight in, Gemini's PCM comes straight out.
+    api_key: "${GEMINI_API_KEY}"
+    model: "models/gemini-3.1-flash-live-preview"   # half-cascade, fast first-audio. also: models/gemini-2.5-flash-native-audio-preview-12-2025
+    voice_name: "Aoede"                          # Puck, Charon, Kore, Fenrir, Aoede
+    temperature: 0.8
+    input_rate: 16000                            # what we send (must match audio.sample_rate)
+    output_rate: 24000                           # what Gemini Live emits (resampled to 16k for Opus)
+    system_instruction: |
+      You are a friendly voice assistant talking through a small Wi-Fi
+      speaker. Keep replies brief and conversational — one or two short
+      sentences unless the user explicitly asks for more.
 
   stall:
     enabled: true                              # decide if a stall phrase is needed while the agent works

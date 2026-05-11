@@ -62,8 +62,8 @@ uint8_t compressedMicBuffer[SAMPLE_CHUNK];
 float running_dc = 0.0f;
 
 // Speaker buffer (stereo-interleaved for ALL_RIGHT I2S)
-int16_t spkBuffer[8192];
-int bufferThreshold = 2048; // 128ms at 16kHz — more headroom against WiFi jitter
+int16_t spkBuffer[16384];          // 1024 ms at 16 kHz mono (stereo-interleaved)
+int bufferThreshold = 4000;        // ~250 ms initial pre-roll — survives Gemini's bursty deliveries
 const size_t tcpBufSize = 512;
 uint8_t tcpBuffer[tcpBufSize];
 
@@ -234,7 +234,11 @@ void opusDecodeTask(void *param)
 {
     Serial.println("Opus decode task started");
 
-    if (!audioClient.connected() || opus_decoder == NULL)
+    // Accept either an open socket OR a closed-but-buffered one: a fast server
+    // can drain its writes and send FIN before this task runs, leaving us with
+    // a closed connection that still has all our Opus data sitting in the
+    // receive buffer.
+    if ((!audioClient.connected() && audioClient.available() <= 0) || opus_decoder == NULL)
     {
         Serial.println("ERROR: Invalid client or decoder");
         opusTaskRunning = false;
@@ -361,7 +365,10 @@ void opusDecodeTask(void *param)
             spkBuffer[totalSamples++] = s; // R
         }
 
-        int writeThreshold = initialBufferFilled ? 640 : bufferThreshold * 2;
+        // After the initial pre-roll, write to I2S in ~100 ms slabs (3200 stereo
+        // samples = 1600 mono) instead of 20 ms — gives the playback buffer
+        // more in-flight headroom so Wi-Fi jitter doesn't underrun the DMA.
+        int writeThreshold = initialBufferFilled ? 3200 : bufferThreshold * 2;
         if (totalSamples >= writeThreshold)
         {
             if (!initialBufferFilled)

@@ -4,6 +4,7 @@ from typing import AsyncIterator
 from pipeline.conversation.base import ConversationBackend
 from pipeline.conversation.conversational import ConversationalBackend
 from pipeline.conversation.agentic import AgenticBackend
+from pipeline.conversation.gemini_live import GeminiLiveBackend
 
 # Primary: punctuation followed by whitespace (safe, standard).
 _SENTENCE_END = re.compile(r"[.!?\n]+\s+")
@@ -43,5 +44,7 @@ def create_backend(config: dict, device_id: str) -> ConversationBackend:
         return ConversationalBackend(conv_cfg["conversational"], device_id)
     elif backend == "agentic":
         return AgenticBackend(conv_cfg["agentic"], device_id)
+    elif backend == "gemini_live":
+        return GeminiLiveBackend(conv_cfg["gemini_live"], device_id)
     else:
         raise ValueError(f"Unknown conversation backend: {backend}")

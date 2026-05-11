@@ -13,6 +13,7 @@ if sys.platform == "darwin" and ctypes.util.find_library("opus") is None:
 import numpy as np
 import opuslib
 from scipy.io.wavfile import write as wav_write
+from scipy.signal import resample_poly
 
 # u-law decompression table (ITU-T G.711)
 ULAW_TABLE = np.array([
@@ -62,8 +63,17 @@ def pcm_to_wav(samples: np.ndarray, rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-def opus_encode(pcm_data: bytes, sample_rate: int = 16000, frame_size: int = 320) -> list[bytes]:
-    encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
+def opus_encode(pcm_data: bytes, sample_rate: int = 16000, frame_size: int = 320,
+                encoder: "opuslib.Encoder | None" = None) -> list[bytes]:
+    """Encode PCM into Opus frames.
+
+    Pass an existing `encoder` to keep predictor state across calls — required
+    when you're streaming audio in chunks to a single client decoder, since
+    the decoder maintains state across frames and gets confused if every chunk
+    comes from a freshly initialised encoder.
+    """
+    if encoder is None:
+        encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
     frame_bytes = frame_size * 2  # 16-bit mono
     frames = []
     for i in range(0, len(pcm_data), frame_bytes):
@@ -72,6 +82,21 @@ def opus_encode(pcm_data: bytes, sample_rate: int = 16000, frame_size: int = 320
             chunk += b'\x00' * (frame_bytes - len(chunk))
         frames.append(encoder.encode(chunk, frame_size))
     return frames
+
+
+def resample_pcm_int16(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Resample 16-bit mono PCM. Used to convert Gemini Live's 24 kHz output
+    down to the 16 kHz our Opus encoder uses."""
+    if src_rate == dst_rate:
+        return pcm_bytes
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+    # resample_poly works on integers but produces float; small up/down keeps
+    # the polyphase filter cheap.
+    from math import gcd
+    g = gcd(src_rate, dst_rate)
+    up, down = dst_rate // g, src_rate // g
+    out = resample_poly(audio.astype(np.float32), up=up, down=down)
+    return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
 
 
 def opus_frames_to_tcp_payload(opus_frames: list[bytes]) -> bytes:

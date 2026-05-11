@@ -17,9 +17,13 @@ build/
 .LSOverride
 
 # Secrets & local config
+.env
+.env.local
 pipeline/config.yaml
 m5_echo/credentials.h
 m5_echo/git_hash.h
+onjuino/credentials.h
+onjuino/git_hash.h
 
 # Runtime data & test output
 data/

@@ -9,14 +9,39 @@ import warnings
 
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 
+
+def _load_dotenv() -> None:
+    """Load `.env` from the repo root into os.environ if present. Keeps the
+    pipeline dependency-free of python-dotenv — we only support the simple
+    KEY=VALUE form, which is all we need for API tokens."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
+
 import numpy as np
 import yaml
 
-from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav
+from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, resample_pcm_int16
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
 from pipeline.device import Device, DeviceManager
-from pipeline.protocol import send_audio, send_led_blink, open_led_connection, write_led_blink, close_led_connection
+from pipeline.protocol import (
+    send_audio, send_led_blink,
+    open_led_connection, write_led_blink, close_led_connection,
+    open_audio_stream, write_opus_frames_stream, close_audio_stream,
+)
 from pipeline.services import asr, tts
 
 log = logging.getLogger(__name__)
@@ -197,17 +222,147 @@ async def multicast_listener(config: dict, manager: DeviceManager):
         await greet_device(device, config)
 
 
+async def process_live_utterance(device: Device, audio_int16: np.ndarray, config: dict) -> None:
+    """End-to-end Gemini Live path: PCM in, PCM out, no ASR / no TTS.
+
+    Holds open ONE TCP audio stream for the whole turn so the device sees a
+    single continuous Opus stream. Doing it per-chunk caused audible clicks:
+    Opus decoders need a few frames of warm-up at the start of each stream
+    and the device's persistent decoder treats each TCP burst as its own
+    stream, suppressing the first ~40 ms of every chunk.
+    """
+    tcp_port = config["network"]["tcp_port"]
+    dev_cfg = config["device"]
+    sample_rate = config["audio"]["sample_rate"]
+    opus_frame_size = config["audio"]["opus_frame_size"]
+
+    # 200 ms of 16 kHz int16 = 6400 bytes = exactly 10 Opus frames of 20 ms.
+    flush_bytes = sample_rate * 2 * 200 // 1000
+    live_cfg = config["conversation"].get("gemini_live", {})
+    input_rate = int(live_cfg.get("input_rate", 16000))
+    output_rate = int(live_cfg.get("output_rate", 24000))
+
+    pcm_in_bytes = audio_int16.astype(np.int16).tobytes()
+    if input_rate != sample_rate:
+        pcm_in_bytes = resample_pcm_int16(pcm_in_bytes, sample_rate, input_rate)
+
+    import opuslib as _opuslib
+    turn_encoder = _opuslib.Encoder(sample_rate, 1, _opuslib.APPLICATION_VOIP)
+
+    turn_t0 = time.monotonic()
+    out_buffer = bytearray()
+    first_audio_at: float | None = None
+    writer: asyncio.StreamWriter | None = None
+
+    async def ensure_stream() -> bool:
+        """Open the persistent audio stream on demand (right before the first frame)."""
+        nonlocal writer
+        if writer is not None:
+            return True
+        writer = await open_audio_stream(
+            device.ip, tcp_port,
+            mic_timeout=dev_cfg["default_mic_timeout"],
+            volume=dev_cfg["default_volume"],
+            fade=dev_cfg["led_fade"],
+        )
+        if writer is None:
+            log.error(f"LIVE  failed to open audio stream to {device.ip}")
+            return False
+        return True
+
+    try:
+        async for chunk_out in device.conversation.converse(pcm_in_bytes):
+            if device.interrupted.is_set():
+                log.info(f"LIVE  interrupted during response")
+                break
+            if first_audio_at is None:
+                first_audio_at = time.monotonic() - turn_t0
+                log.info(f"LIVE  [+{first_audio_at:.2f}s] first response audio "
+                         f"({len(chunk_out)} bytes @ {output_rate} Hz)")
+            chunk_16k = resample_pcm_int16(chunk_out, output_rate, sample_rate)
+            out_buffer.extend(chunk_16k)
+
+            while len(out_buffer) >= flush_bytes:
+                ready = bytes(out_buffer[:flush_bytes])
+                del out_buffer[:flush_bytes]
+                frames = opus_encode(ready, sample_rate, opus_frame_size,
+                                     encoder=turn_encoder)
+                if not await ensure_stream():
+                    return
+                if not await write_opus_frames_stream(writer, frames):
+                    log.warning(f"LIVE  audio stream dropped mid-turn")
+                    writer = None
+                    break
+            if device.interrupted.is_set():
+                break
+
+        # Final flush: whatever audio is left is the tail of the turn.
+        tail = bytes(out_buffer)
+        out_buffer.clear()
+        if tail and writer is not None and not device.interrupted.is_set():
+            frames = opus_encode(tail, sample_rate, opus_frame_size,
+                                 encoder=turn_encoder)
+            if not await write_opus_frames_stream(writer, frames):
+                log.warning(f"LIVE  audio stream dropped on tail")
+                writer = None
+
+        if writer is not None:
+            await close_audio_stream(writer)
+            writer = None
+        elif not device.ptt:
+            # No audio went out at all — reopen the mic so the user isn't stuck.
+            await send_audio(device.ip, tcp_port, b"",
+                             mic_timeout=dev_cfg["default_mic_timeout"],
+                             volume=0, fade=0)
+
+        elapsed = time.monotonic() - turn_t0
+        ttfa = f"{first_audio_at:.2f}s" if first_audio_at is not None else "—"
+        log.info(f"LIVE  [{ttfa} first / {elapsed:.2f}s total]")
+    except Exception as e:
+        log.error(f"LIVE  pipeline error ({device.hostname}): {e}")
+        if writer is not None:
+            try:
+                await close_audio_stream(writer)
+            except Exception:
+                pass
+            writer = None
+        if not device.ptt:
+            try:
+                await send_audio(device.ip, tcp_port, b"",
+                                 mic_timeout=dev_cfg["default_mic_timeout"],
+                                 volume=0, fade=0)
+            except Exception:
+                pass
+
+
 async def process_utterances(config: dict, manager: DeviceManager, utterance_queue: asyncio.Queue):
-    """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP."""
+    """Process complete utterances: ASR -> Conversation -> TTS -> Opus -> TCP.
+
+    For the `gemini_live` backend we skip ASR and TTS entirely — audio goes
+    straight into the Live WebSocket and audio comes straight back.
+    """
     tcp_port = config["network"]["tcp_port"]
     dev_cfg = config["device"]
     no_speech_threshold = 0.45
+    live_mode = config["conversation"].get("backend") == "gemini_live"
 
     while True:
         device, audio_int16 = await utterance_queue.get()
 
         device.processing = True
         device.interrupted.clear()
+
+        # Gemini Live: bypass the entire text pipeline.
+        if live_mode:
+            try:
+                if device.vad_writer is not None:
+                    await close_led_connection(device.vad_writer)
+                    device.vad_writer = None
+                await process_live_utterance(device, audio_int16, config)
+            finally:
+                device.processing = False
+            utterance_queue.task_done()
+            continue
 
         try:
             # Safety: close any lingering LED connection before processing
@@ -526,24 +681,42 @@ def _log_startup_summary(config: dict) -> None:
                      f"(timeout={stall_cfg.get('timeout', 1.5)}s)")
         else:
             log.info("  STALL disabled")
+    elif backend_name == "gemini_live":
+        model = backend_cfg.get("model", "?")
+        voice = backend_cfg.get("voice_name", "(default)")
+        log.info(f"  LIVE  gemini live: {model}  voice={voice}  "
+                 f"(end-to-end audio, ASR/TTS skipped)")
     else:
         log.info(f"  LLM   conversational: {backend_cfg.get('model', '?')} "
                  f"@ {backend_cfg.get('base_url', '?')}")
 
-    tts_cfg = config["tts"]
-    tts_backend = tts_cfg.get("backend", "?")
-    if tts_backend == "elevenlabs":
-        el = tts_cfg.get("elevenlabs", {})
-        vox = el.get("default_voice", "?")
-        ptt = el.get("default_voice_ptt", vox)
-        log.info(f"  TTS   elevenlabs: VOX={vox} PTT={ptt}")
-    else:
-        log.info(f"  TTS   {tts_backend}")
+    if backend_name != "gemini_live":
+        tts_cfg = config["tts"]
+        tts_backend = tts_cfg.get("backend", "?")
+        if tts_backend == "elevenlabs":
+            el = tts_cfg.get("elevenlabs", {})
+            vox = el.get("default_voice", "?")
+            ptt = el.get("default_voice_ptt", vox)
+            log.info(f"  TTS   elevenlabs: VOX={vox} PTT={ptt}")
+        else:
+            log.info(f"  TTS   {tts_backend}")
 
 
 async def warmup(config: dict):
     """Validate conversation backend and TTS are reachable."""
-    log.info("Warming up conversation backend and TTS...")
+    live_mode = config["conversation"].get("backend") == "gemini_live"
+    log.info("Warming up conversation backend" + ("" if live_mode else " and TTS") + "...")
+
+    async def _warmup_live():
+        from pipeline.conversation.gemini_live import GeminiLiveBackend
+        t0 = time.time()
+        try:
+            backend = GeminiLiveBackend(config["conversation"]["gemini_live"], "_warmup")
+            await backend._ensure_connected()
+            await backend.close()
+            log.info(f"LIVE warmup OK  ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            log.error(f"LIVE warmup FAILED ({time.time() - t0:.1f}s): {e}")
 
     async def _warmup_conversation():
         t0 = time.time()
@@ -569,7 +742,10 @@ async def warmup(config: dict):
         except Exception as e:
             log.error(f"TTS  warmup FAILED ({time.time() - t0:.1f}s): {e}")
 
-    await asyncio.gather(_warmup_conversation(), _warmup_tts())
+    if live_mode:
+        await _warmup_live()
+    else:
+        await asyncio.gather(_warmup_conversation(), _warmup_tts())
     log.info("Warmup complete")
 
 
