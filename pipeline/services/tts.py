@@ -3,7 +3,11 @@ import logging
 import os
 
 import httpx
+import numpy as np
 from pydub import AudioSegment
+from scipy.io import wavfile
+
+from pipeline.audio import resample_pcm_int16
 
 log = logging.getLogger(__name__)
 
@@ -15,6 +19,8 @@ async def synthesize(text: str, voice: str, config: dict) -> bytes:
         return await _elevenlabs(text, voice, config)
     if backend == "local":
         return await _local(text, config)
+    if backend == "navai_uz":
+        return await _navai_uz(text, config)
     raise ValueError(f"Unknown TTS backend: {backend}")
 
 
@@ -39,6 +45,43 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
     audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
     log.debug(f"TTS: {len(text)} chars -> {len(audio)}ms audio")
     return audio.raw_data
+
+
+async def _navai_uz(text: str, config: dict) -> bytes:
+    """NavAI Uzbek TTS — returns 24 kHz int16 mono WAV, we down-sample to 16 kHz."""
+    cfg = config["tts"]["navai_uz"]
+    url = cfg["url"].rstrip("/") + cfg.get("path", "/synthesize/local")
+    data = {
+        "target_text": text,
+        "output_format": "wav",
+    }
+    # voice_id must be a query parameter, not a form field — the server
+    # ignores form `voice_id` and rejects with "Voice ID 'x' not found"
+    # unless it arrives via the querystring. Confirmed by direct probe.
+    params: dict[str, str] = {}
+    if (voice_id := cfg.get("voice_id")):
+        params["voice_id"] = voice_id
+    timeout = float(cfg.get("timeout", 60))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, data=data, params=params)
+        resp.raise_for_status()
+        wav_bytes = resp.content
+
+    sr, audio = wavfile.read(io.BytesIO(wav_bytes))
+    if audio.dtype != np.int16:
+        # The endpoint advertises 16-bit PCM but be defensive.
+        if audio.dtype.kind == "f":
+            audio = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        else:
+            audio = audio.astype(np.int16)
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    pcm = audio.tobytes()
+    target_rate = config["audio"]["sample_rate"]
+    if sr != target_rate:
+        pcm = resample_pcm_int16(pcm, sr, target_rate)
+    log.debug(f"TTS navai_uz: {len(text)} chars -> {len(pcm)//2} samples @ {target_rate} Hz")
+    return pcm
 
 
 async def _local(text: str, config: dict) -> bytes:
