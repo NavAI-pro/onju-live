@@ -29,11 +29,23 @@ class Device:
         self.led_power = 0
         self.led_update_time = 0.0
         self.vad_writer: asyncio.StreamWriter | None = None  # persistent TCP for LED blinks
+        # User-facing volume on a 0..100 scale, mutable via the set_volume tool.
+        # Default seeded from config.device.default_volume (0..20 firmware scale) × 5.
+        self.volume: int = max(0, min(100, int(config["device"].get("default_volume", 15)) * 5))
+        # Wake-word override: epoch timestamp until which the wake-word filter
+        # is bypassed. Set to +inf while the PTT button is held; on release,
+        # bumped to now+2.0s so any utterance Silero VAD is still chunking at
+        # the trailing edge of the press still gets the bypass.
+        self.ptt_override_until: float = 0.0
 
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT
         self.processing = False     # True while ASR/LLM/TTS pipeline is running
         self.interrupted = asyncio.Event()
+
+    @property
+    def ptt_override(self) -> bool:
+        return time.time() < self.ptt_override_until
 
     def to_dict(self) -> dict:
         return {

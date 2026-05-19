@@ -36,6 +36,7 @@ import yaml
 from pipeline.audio import decode_ulaw, opus_encode, opus_frames_to_tcp_payload, pcm_to_wav, resample_pcm_int16
 from pipeline.conversation import create_backend, sentence_chunks
 from pipeline.conversation import stall as stall_mod
+from pipeline.conversation.tools import current_device as _current_device_ctx
 from pipeline.device import Device, DeviceManager
 from pipeline.protocol import (
     send_audio, send_led_blink,
@@ -113,6 +114,16 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
         if device is None and addr[0] == "127.0.0.1":
             device = manager.get_most_recent()
         if device is None:
+            continue
+
+        # PTT marker packets from firmware: 4-byte literals "PTT1" (button
+        # pressed, override wake-word filter) and "PTT0" (released — leave a
+        # 2s trailing window so VAD-chunked utterances overlapping the edge
+        # still get bypassed).
+        if len(data) == 4 and data[:3] == b"PTT":
+            held = data[3:4] == b"1"
+            device.ptt_override_until = float("inf") if held else time.time() + 2.0
+            log.info(f"PTT  override {'ON' if held else 'OFF (2s grace)'} for {device.hostname}")
             continue
 
         now = time.time()
@@ -388,6 +399,24 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                                      volume=0, fade=0)
                 continue
 
+            # Wake-word filter: only apply to VOX devices (PTT devices are
+            # always "intentional"). Bypassed for VOX too while the button is
+            # held (device.ptt_override) so the user can force a turn.
+            ww_cfg = config.get("wake_word", {}) or {}
+            if ww_cfg.get("enabled") and not device.ptt and not device.ptt_override:
+                phrases = [p.lower() for p in (ww_cfg.get("phrases") or [])]
+                norm = text.lower()
+                hit = next((p for p in phrases if p in norm), None)
+                if not hit:
+                    log.info(f"WAKE  no match in {text!r} — dropping")
+                    continue
+                # Strip wake-word + leading punctuation/connectors so the LLM
+                # sees the user's actual request.
+                idx = norm.find(hit)
+                stripped = (text[:idx] + text[idx + len(hit):]).strip(" ,.!?:;'-")
+                log.info(f"WAKE  matched {hit!r} -> {stripped!r}")
+                text = stripped or text  # if user only said the wake-word, fall back to greeting
+
             # Check for interrupt before LLM
             if device.interrupted.is_set():
                 log.info(f"Interrupted before LLM")
@@ -427,9 +456,11 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
                          f"{len(frames)} opus frames to {device.ip} "
                          f"({'final' if is_final else 'partial'}: {sentence!r})")
+                # device.volume is 0..100; firmware native range is 0..20.
+                volume_byte = max(0, min(20, round(device.volume / 5)))
                 await send_audio(device.ip, tcp_port, payload,
                                  mic_timeout=mic_timeout,
-                                 volume=dev_cfg["default_volume"],
+                                 volume=volume_byte,
                                  fade=dev_cfg["led_fade"])
                 if not is_final:
                     sent_partial = True
@@ -476,6 +507,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 )
 
             aborted = False
+            _device_ctx_token = _current_device_ctx.set(device)
             try:
                 stream_start_at = time.monotonic()
                 async for sentence in sentence_chunks(
@@ -513,6 +545,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                         pass
                 await reopen_mic_if_needed()
                 continue
+            finally:
+                # Clear the device contextvar — runs even when the try block
+                # exits via `continue` above.
+                _current_device_ctx.reset(_device_ctx_token)
 
             # Drain the stall task if it's still pending (e.g. LLM stream
             # returned zero content).

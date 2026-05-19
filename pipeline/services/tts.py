@@ -48,22 +48,27 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
 
 
 async def _navai_uz(text: str, config: dict) -> bytes:
-    """NavAI Uzbek TTS — returns 24 kHz int16 mono WAV, we down-sample to 16 kHz."""
+    """NavAI Uzbek TTS — returns 24 kHz int16 mono WAV, we down-sample to 16 kHz.
+
+    Request shape matches the canonical NavAI curl:
+        curl -X POST /synthesize/<mode> -F target_text=... -F output_format=wav
+    where <mode> is one of the enabled modes (currently 'local'; 'http' is
+    documented but the production host rejects it with 400 until enabled).
+    `voice_id` is sent as a query parameter — the server ignores form
+    `voice_id` and rejects with "Voice ID 'x' not found" otherwise.
+    """
     cfg = config["tts"]["navai_uz"]
     url = cfg["url"].rstrip("/") + cfg.get("path", "/synthesize/local")
-    data = {
-        "target_text": text,
-        "output_format": "wav",
+    files = {
+        "target_text": (None, text),
+        "output_format": (None, "wav"),
     }
-    # voice_id must be a query parameter, not a form field — the server
-    # ignores form `voice_id` and rejects with "Voice ID 'x' not found"
-    # unless it arrives via the querystring. Confirmed by direct probe.
     params: dict[str, str] = {}
     if (voice_id := cfg.get("voice_id")):
         params["voice_id"] = voice_id
     timeout = float(cfg.get("timeout", 60))
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, data=data, params=params)
+        resp = await client.post(url, files=files, params=params)
         resp.raise_for_status()
         wav_bytes = resp.content
 

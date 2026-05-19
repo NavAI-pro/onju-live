@@ -410,40 +410,34 @@ void micTask(void *param)
     {
         bool buttonDown = !digitalRead(BUTTON_PIN);
 
-        // Button just pressed
-        if (buttonDown && !prevButton)
+        // Edge-triggered PTT marker packets to the server. The server uses
+        // these to bypass its wake-word filter while the button is held.
+        // The button no longer gates mic capture — that's always-on now.
+        if (buttonDown != prevButton && serverIP != IPAddress(0, 0, 0, 0))
         {
-            Serial.println("PTT pressed");
-            pttActive = true;
-            // Wait for Opus task to stop using I2S (it checks pttActive)
-            while (isPlaying) vTaskDelay(1);
-            initMicI2S();
-            setLed(0, 255, 50, 200, 10);
+            const char *marker = buttonDown ? "PTT1" : "PTT0";
+            udp.beginPacket(serverIP, 3000);
+            udp.write((const uint8_t *)marker, 4);
+            udp.endPacket();
+            Serial.println(buttonDown ? "PTT pressed (override marker sent)"
+                                      : "PTT released (marker sent)");
+            if (buttonDown) setLed(0, 255, 50, 200, 10);
+            else            ledLevel = 0;
         }
-
-        // Button just released
-        if (!buttonDown && prevButton)
-        {
-            Serial.println("PTT released");
-            pttActive = false;
-            initSpeakerI2S();
-            ledLevel = 0;
-        }
-
+        pttActive = buttonDown;  // kept for compatibility (LED feedback, etc.)
         prevButton = buttonDown;
 
-        bool micActive = pttActive || (forceMicUntil > millis());
+        // Always-on mic: capture continuously except when the speaker is
+        // playing audio (PDM mic and I2S speaker share pins on M5 Echo).
+        bool micActive = !isPlaying;
 
-        // Handle force-mic I2S mode transitions
-        if (micActive && !pttActive && currentMode != MODE_MIC)
+        if (micActive && currentMode != MODE_MIC)
         {
-            if (isPlaying) { interruptPlayback = true; while (isPlaying) vTaskDelay(1); }
             initMicI2S();
         }
-        if (!micActive && !pttActive && currentMode == MODE_MIC)
+        if (!micActive && currentMode == MODE_MIC)
         {
             initSpeakerI2S();
-            Serial.println("Force mic off");
         }
 
         if (micActive && serverIP != IPAddress(0, 0, 0, 0))
@@ -557,9 +551,11 @@ void setup()
     else if (serverIP != IPAddress(0, 0, 0, 0))
         Serial.printf("Using saved server IP: %s\n", serverIP.toString().c_str());
 
-    // Multicast announcement — include "PTT" so bridge auto-starts call
+    // Multicast announcement — VOX mode (always-on mic + server wake-word).
+    // Button press still emits PTT1/PTT0 marker packets to UDP :3000 so the
+    // server can bypass the wake-word filter while the user holds the button.
     udp.beginPacket(IPAddress(239, 0, 0, 1), 12345);
-    String announce = String(desired_hostname) + " " + String(GIT_HASH) + " PTT";
+    String announce = String(desired_hostname) + " " + String(GIT_HASH);
     udp.write((const uint8_t *)announce.c_str(), announce.length());
     udp.endPacket();
     Serial.println("Announced on multicast (PTT mode)");
