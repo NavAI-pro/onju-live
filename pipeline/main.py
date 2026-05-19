@@ -120,11 +120,15 @@ async def udp_listener(config: dict, manager: DeviceManager, utterance_queue: as
         # PTT marker packets from firmware: 4-byte literals "PTT1" (button
         # pressed, override wake-word filter) and "PTT0" (released — leave a
         # 2s trailing window so VAD-chunked utterances overlapping the edge
-        # still get bypassed).
+        # still get bypassed). A press while music is playing also cancels
+        # the playback — it's the user's natural "stop" gesture.
         if len(data) == 4 and data[:3] == b"PTT":
             held = data[3:4] == b"1"
             device.ptt_override_until = float("inf") if held else time.time() + 2.0
             log.info(f"PTT  override {'ON' if held else 'OFF (2s grace)'} for {device.hostname}")
+            if held and device.music_task is not None and not device.music_task.done():
+                log.info(f"PTT  cancelling music_task ({device.music_title!r})")
+                device.music_task.cancel()
             continue
 
         now = time.time()
@@ -376,6 +380,10 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             utterance_queue.task_done()
             continue
 
+        # Turn-local state visible to the outer `finally` even on early
+        # `continue` paths (wake-word filter, ASR no-speech, etc.).
+        response_text: str = ""
+
         try:
             # Safety: close any lingering LED connection before processing
             if device.vad_writer is not None:
@@ -400,13 +408,41 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                                      volume=0, fade=0)
                 continue
 
+            # Music-active filter: when a music task is running and we get a
+            # VAD utterance, it can only have come from a 1.2 s duck window.
+            # During the duck the speaker's last frames still echo in the
+            # room and the mic catches residual bleed. Apply much stricter
+            # thresholds so "music garbage" doesn't trigger LLM turns —
+            # require a longer transcript, a lower no_speech_prob, and (the
+            # important one) the wake-word, even inside a follow-up window.
+            music_active = device.music_task is not None and not device.music_task.done()
+            if music_active:
+                MIN_CHARS_DURING_MUSIC = 8
+                NSP_LIMIT_DURING_MUSIC = 0.25
+                if len(text) < MIN_CHARS_DURING_MUSIC or (
+                    nsp is not None and nsp > NSP_LIMIT_DURING_MUSIC
+                ):
+                    log.info(
+                        f"MUSIC duck: dropping short/low-conf ASR "
+                        f"{text!r} (len={len(text)} nsp={nsp})"
+                    )
+                    continue
+
             # Wake-word filter: only apply to VOX devices (PTT devices are
             # always "intentional"). Bypassed while the button is held
             # (device.ptt_override) or during the short follow-up window
             # right after the assistant replied (device.in_followup) so the
-            # user can say "ha yubor" / "yes" naturally.
+            # user can say "ha yubor" / "yes" naturally. EXCEPT during
+            # music — the follow-up bypass is suppressed because the LLM's
+            # last reply was likely the play_music confirmation and any
+            # follow-up utterance during a duck must be wake-word-gated to
+            # avoid music bleed false positives.
             ww_cfg = config.get("wake_word", {}) or {}
-            if ww_cfg.get("enabled") and not device.ptt and not device.ptt_override and not device.in_followup:
+            bypass_wake = (
+                device.ptt_override
+                or (device.in_followup and not music_active)
+            )
+            if ww_cfg.get("enabled") and not device.ptt and not bypass_wake:
                 phrases = [re.escape(p.lower()) for p in (ww_cfg.get("phrases") or [])]
                 # Match phrase stems plus any trailing word characters
                 # ("muxlis" → also catches "muxlisa", "muxlisi", "muxliso", etc.)
@@ -592,11 +628,6 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             if response_text:
                 device.conversation.commit(response_text)
             device.last_response = response_text
-            # Open a short follow-up window so the user can answer without
-            # re-invoking the wake-word ("ha yubor", "yo'q", clarifications).
-            # 20 s is enough for the reply audio to finish playing on the
-            # device + the user to hear it + think + speak.
-            device.followup_until = time.time() + 20.0
             elapsed = time.monotonic() - turn_t0
             ttfs = f"{first_sentence_at - turn_t0:.2f}s" if first_sentence_at else "—"
             log.info(f"LLM  [{ttfs} first / {elapsed:.2f}s total / "
@@ -614,6 +645,40 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     pass
         finally:
             device.processing = False
+            # Open a follow-up window after every turn ends so the user can
+            # answer naturally without the wake-word. 30s default, extended
+            # to 45s when the reply ends with a question — the LLM is
+            # explicitly inviting an answer and the user often takes longer.
+            ends_question = bool(response_text and response_text.rstrip()[-1:] in "?؟")
+            device.followup_until = time.time() + (45.0 if ends_question else 30.0)
+
+            # Post-TTS music dispatch. play_music QUEUES a track on
+            # device.pending_music; we spawn the streaming task here so it
+            # doesn't race the LLM's spoken confirmation on the audio TCP.
+            # `pending_music` wins over `music_resume` (a fresh request
+            # supersedes a pause-and-resume).
+            pending = getattr(device, "pending_music", None)
+            resume = getattr(device, "music_resume", None)
+            from pipeline.conversation.tools import _run_music_task
+            if pending and (device.music_task is None or device.music_task.done()):
+                device.pending_music = None
+                device.music_resume = None
+                device.music_title = pending.get("title")
+                device.music_task = asyncio.create_task(
+                    _run_music_task(device, pending)
+                )
+                log.info(f"MUSIC dispatch {pending.get('title')!r}")
+            elif resume and (device.music_task is None or device.music_task.done()):
+                device.music_resume = None
+                device.music_title = resume.get("title")
+                device.music_task = asyncio.create_task(
+                    _run_music_task(device, resume,
+                                    start_offset_s=resume.get("elapsed_s", 0.0))
+                )
+                log.info(
+                    f"MUSIC auto-resume {resume.get('title')!r} "
+                    f"@ {resume.get('elapsed_s', 0.0):.1f}s"
+                )
 
         utterance_queue.task_done()
 

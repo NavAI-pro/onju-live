@@ -148,6 +148,29 @@ async def _resolve_entity(client: TelegramClient, target: str | int):
     return None
 
 
+async def read_recent_messages(target: str | int, limit: int = 5) -> dict[str, Any]:
+    """Return the most recent messages (oldest→newest) from a chat/user."""
+    client = await get_client()
+    if client is None:
+        return {"error": "Telegram not configured / not logged in."}
+    entity = await _resolve_entity(client, target)
+    if entity is None:
+        return {"error": f"Could not find target {target!r} in recent dialogs."}
+    limit = max(1, min(int(limit), 20))
+    msgs = []
+    async for m in client.iter_messages(entity, limit=limit):
+        # Skip messages the user themselves sent (they don't need them read back).
+        msgs.append({
+            "id": m.id,
+            "out": m.out,                 # True if sent by us
+            "date": m.date.isoformat() if m.date else None,
+            "from_name": getattr(m.sender, "first_name", None) if m.sender else None,
+            "text": (m.message or "").strip(),
+        })
+    msgs.reverse()  # oldest first
+    return {"to": _entity_summary(entity), "count": len(msgs), "messages": msgs}
+
+
 async def send_message(target: str | int, text: str) -> dict[str, Any]:
     """Send `text` as the user to `target` (username, phone, or numeric id)."""
     client = await get_client()

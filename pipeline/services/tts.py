@@ -50,25 +50,33 @@ async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
 async def _navai_uz(text: str, config: dict) -> bytes:
     """NavAI Uzbek TTS — returns 24 kHz int16 mono WAV, we down-sample to 16 kHz.
 
-    Request shape matches the canonical NavAI curl:
-        curl -X POST /synthesize/<mode> -F target_text=... -F output_format=wav
-    where <mode> is one of the enabled modes (currently 'local'; 'http' is
-    documented but the production host rejects it with 400 until enabled).
-    `voice_id` is sent as a query parameter — the server ignores form
-    `voice_id` and rejects with "Voice ID 'x' not found" otherwise.
+    Request shape matches NavAI's canonical curl:
+        curl -X POST /synthesize/<mode>
+          -F target_text=...
+          -F voice_id=muxlisa
+          -F reference_audio=
+          -F reference_text=...
+          -F output_format=wav
+
+    All parameters go as multipart form fields. `voice_id` selects the
+    default voice on the server; `reference_audio` + `reference_text` are
+    the voice-cloning slots (left empty when using a pre-loaded voice).
     """
     cfg = config["tts"]["navai_uz"]
     url = cfg["url"].rstrip("/") + cfg.get("path", "/synthesize/local")
     files = {
         "target_text": (None, text),
-        "output_format": (None, "wav"),
+        "output_format": (None, cfg.get("output_format", "wav")),
     }
-    params: dict[str, str] = {}
-    if (voice_id := cfg.get("voice_id")):
-        params["voice_id"] = voice_id
+    if voice_id := cfg.get("voice_id"):
+        files["voice_id"] = (None, voice_id)
+    # Voice-cloning slots — sent as empty by default to match the canonical
+    # curl. Override via config if you want to clone from a reference clip.
+    files["reference_audio"] = (None, cfg.get("reference_audio", ""))
+    files["reference_text"] = (None, cfg.get("reference_text", ""))
     timeout = float(cfg.get("timeout", 60))
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, files=files, params=params)
+        resp = await client.post(url, files=files)
         resp.raise_for_status()
         wav_bytes = resp.content
 

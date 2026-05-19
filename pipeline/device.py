@@ -41,6 +41,20 @@ class Device:
         # next utterance without requiring the wake-word, so the user can say
         # "ha yubor" / "yes send" / a quick clarification naturally.
         self.followup_until: float = 0.0
+        # Long-running music playback task (yt-dlp + ffmpeg streaming Opus).
+        # Cancelled by the stop_music tool or a PTT button press.
+        self.music_task: asyncio.Task | None = None
+        self.music_title: str | None = None
+        # Queued track from a play_music tool call in the current turn — held
+        # here so process_utterances can spawn the music task AFTER the LLM's
+        # TTS confirmation finishes playing (otherwise the TTS audio TCP
+        # would clobber the music TCP).
+        self.pending_music: dict | None = None
+        # If music gets paused mid-song (button press → mic capture → command),
+        # the music task stashes its remaining context here so the turn-end
+        # bookkeeping can auto-resume from the same point. Cleared on
+        # stop_music or a new play_music.
+        self.music_resume: dict | None = None
 
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT

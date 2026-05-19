@@ -364,6 +364,169 @@ async def get_weather(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# ─── music ──────────────────────────────────────────────────────────────────
+
+async def _run_music_task(device, info: dict[str, Any],
+                          start_offset_s: float = 0.0) -> None:
+    """Spawned per song. Streams the source through ffmpeg → Opus → TCP in
+    short "play" bursts, dropping the audio stream every few seconds so the
+    device's mic comes back online and the user can issue a voice command
+    ("to'xtat", "boshqa qo'shiq", a wake-word + tool, etc.) without pressing
+    the button. After each duck window, if the task wasn't cancelled, we
+    re-open the audio stream and resume from the same offset."""
+    from pipeline.audio import opus_encode
+    from pipeline.protocol import (open_audio_stream, write_opus_frames_stream,
+                                    close_audio_stream)
+    from pipeline.services import music as music_svc
+
+    config = device.config
+    tcp_port = config["network"]["tcp_port"]
+    sample_rate = config["audio"]["sample_rate"]
+    frame_size = config["audio"]["opus_frame_size"]
+    dev_cfg = config["device"]
+    frame_seconds = frame_size / sample_rate
+
+    # Duck cadence: PLAY_BURST seconds of audio, then DUCK_GAP seconds of
+    # silence with mic active for voice control. Tuned for noticeable but
+    # not unbearable gaps.
+    PLAY_BURST = 8.0
+    DUCK_GAP = 1.2
+
+    import time
+    elapsed_s = start_offset_s
+    log.info(f"MUSIC start {info.get('title')!r} @ {start_offset_s:.1f}s -> {device.hostname}")
+    try:
+        while True:
+            volume_byte = max(0, min(20, round(device.volume / 5)))
+            writer = await open_audio_stream(
+                device.ip, tcp_port,
+                mic_timeout=int(PLAY_BURST + DUCK_GAP + 5),
+                volume=volume_byte,
+                fade=dev_cfg["led_fade"],
+            )
+            if writer is None:
+                log.error("music: could not open audio stream to device")
+                return
+
+            # Rate-limit by wall-clock so the duck fires when the device is
+            # actually ~PLAY_BURST seconds into playback. We pace frame sends
+            # to roughly match real-time (small head allowance for the
+            # device's DMA buffer).
+            burst_started_wall = time.monotonic()
+            burst_started_source = elapsed_s
+            HEAD_ALLOWANCE_S = 0.5  # let the source run a bit ahead of wall-clock
+            try:
+                async for pcm in music_svc.stream_pcm(info["url"], start_s=elapsed_s):
+                    frames = opus_encode(pcm, sample_rate, frame_size)
+                    if not await write_opus_frames_stream(writer, frames):
+                        log.warning("music: write failed, ending playback")
+                        return
+                    elapsed_s += len(frames) * frame_seconds
+                    # If source is running ahead of wall clock, slow down.
+                    source_ahead = (elapsed_s - burst_started_source) - (
+                        time.monotonic() - burst_started_wall
+                    )
+                    if source_ahead > HEAD_ALLOWANCE_S:
+                        await asyncio.sleep(source_ahead - HEAD_ALLOWANCE_S)
+                    # Burst boundary measured in WALL TIME — so the user
+                    # actually hears PLAY_BURST seconds of music before the
+                    # duck.
+                    if (time.monotonic() - burst_started_wall) >= PLAY_BURST:
+                        break
+                else:
+                    return  # ffmpeg ran out — song ended cleanly
+            finally:
+                try:
+                    await close_audio_stream(writer)
+                except Exception:
+                    pass
+
+            # Duck window: device's mic is now open, server's udp_listener
+            # is receiving frames, VAD can chunk an utterance, wake-word
+            # filter can pass it through, and any tool (stop_music, new
+            # play_music, set_volume, etc.) cancels this task.
+            log.info(f"MUSIC duck @ {elapsed_s:.1f}s (mic open {DUCK_GAP}s)")
+            await asyncio.sleep(DUCK_GAP)
+    except asyncio.CancelledError:
+        # Stash a resume context so the next turn's bookkeeping can resume.
+        resume_at = max(0.0, elapsed_s - 1.0)
+        device.music_resume = {
+            "url": info["url"],
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration": info.get("duration"),
+            "elapsed_s": resume_at,
+        }
+        log.info(f"MUSIC paused {info.get('title')!r} @ {resume_at:.1f}s")
+        raise
+    except Exception as e:
+        log.error(f"music task error: {e}")
+    finally:
+        device.music_title = None
+        log.info(f"MUSIC done {info.get('title')!r}")
+
+
+async def play_music(args: dict[str, Any]) -> dict[str, Any]:
+    """Search a song and QUEUE it for playback. The actual streaming task
+    starts after the LLM's TTS confirmation finishes — see the music-queue
+    handling in process_utterances. Avoids the audio-TCP race between the
+    spoken confirmation and the music stream."""
+    device = current_device.get()
+    if device is None:
+        return {"error": "No active device."}
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "Missing 'query'."}
+
+    # Stop any in-flight playback first. Starting a NEW song also wipes any
+    # stashed resume context — the user clearly wants to switch tracks.
+    prev = getattr(device, "music_task", None)
+    if prev and not prev.done():
+        prev.cancel()
+        try:
+            await prev
+        except (asyncio.CancelledError, Exception):
+            pass
+    device.music_resume = None
+    device.pending_music = None
+
+    from pipeline.services import music as music_svc
+    try:
+        info = await music_svc.search_audio_url(query)
+    except Exception as e:
+        return {"error": f"Search failed: {e}"}
+
+    # Queue, don't spawn. process_utterances picks it up post-TTS.
+    device.pending_music = info
+    device.music_title = info.get("title")
+    log.info(f"TOOL play_music({query!r}) -> queued {info.get('title')!r}")
+    return {
+        "ok": True,
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_s": info.get("duration"),
+    }
+
+
+async def stop_music(args: dict[str, Any]) -> dict[str, Any]:
+    """Cancel the currently-playing track and clear any pending resume / queue."""
+    device = current_device.get()
+    if device is None:
+        return {"error": "No active device."}
+    task = getattr(device, "music_task", None)
+    title = (device.music_title
+             or (device.music_resume or {}).get("title")
+             or (device.pending_music or {}).get("title"))
+    # Wipe queue + resume so the turn-end auto-spawn doesn't kick in.
+    device.music_resume = None
+    device.pending_music = None
+    if not task or task.done():
+        return {"ok": True, "was_playing": False, "title": title}
+    task.cancel()
+    log.info(f"TOOL stop_music -> cancelled {title!r}")
+    return {"ok": True, "was_playing": True, "title": title}
+
+
 # ─── telegram ───────────────────────────────────────────────────────────────
 
 async def telegram_find_contact(args: dict[str, Any]) -> dict[str, Any]:
@@ -375,6 +538,18 @@ async def telegram_find_contact(args: dict[str, Any]) -> dict[str, Any]:
     results = await tg.find_contact(query, limit=int(args.get("limit", 5) or 5))
     log.info(f"TOOL telegram_find_contact({query!r}) -> {len(results)} match(es)")
     return {"query": query, "count": len(results), "matches": results}
+
+
+async def telegram_read_messages(args: dict[str, Any]) -> dict[str, Any]:
+    """Read the latest N messages from a Telegram chat/user."""
+    from pipeline.services import telegram as tg
+    target = args.get("target")
+    if not target:
+        return {"error": "Missing 'target' (username, phone, or id)."}
+    res = await tg.read_recent_messages(target, limit=int(args.get("limit", 5) or 5))
+    if "error" not in res:
+        log.info(f"TOOL telegram_read_messages -> {res['to'].get('name')} ({res['count']} msgs)")
+    return res
 
 
 async def telegram_send_message(args: dict[str, Any]) -> dict[str, Any]:
@@ -472,6 +647,42 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "play_music": {
+        "type": "function",
+        "function": {
+            "name": "play_music",
+            "description": (
+                "Start playing a song or audio on the speaker. The query is "
+                "free-form — a song title, artist + title, or a YouTube URL. "
+                "Searches YouTube via yt-dlp and streams the result. Call "
+                "whenever the user asks to play music, qo'shiq, qo'shiqni "
+                "yoqing, etc. After calling, briefly confirm in Uzbek which "
+                "track started ('Yulduz Usmonovaning Birinchi muhabbatim "
+                "qo'shig'i ijro etilmoqda')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Song title, artist + title, or URL.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    "stop_music": {
+        "type": "function",
+        "function": {
+            "name": "stop_music",
+            "description": (
+                "Stop the currently-playing song. Call on 'to'xtat', 'stop', "
+                "'qo'shiqni to'xtat', 'o'chir', etc."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
     "telegram_find_contact": {
         "type": "function",
         "function": {
@@ -498,6 +709,33 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "telegram_read_messages": {
+        "type": "function",
+        "function": {
+            "name": "telegram_read_messages",
+            "description": (
+                "Read the most recent messages from a Telegram chat or user. "
+                "Use when the user asks 'menga X dan kelgan oxirgi xabarni "
+                "o'qib ber', 'X nima yozdi', 'X dan habar bormi', etc. After "
+                "the tool returns, read aloud the most recent incoming "
+                "message(s) in Uzbek; you may also briefly summarise."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Recipient: @username, phone, or numeric id.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many recent messages to fetch (1-20). Default 5.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
     "telegram_send_message": {
         "type": "function",
         "function": {
@@ -505,12 +743,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "description": (
                 "Send a Telegram message AS THE USER (not a bot). HIGH-IMPACT: "
                 "the message will appear from the user's account in real time, "
-                "visible to the recipient. BEFORE calling this, ALWAYS read "
-                "back the recipient name and the proposed message text in "
-                "Uzbek and wait for an explicit confirmation like 'ha, yubor', "
-                "'yes send', or 'oʻq, yubor'. Only call after the user clearly "
-                "confirms. If the user asks to change the wording or recipient, "
-                "re-propose and re-confirm before sending."
+                "visible to the recipient. STRICT PROTOCOL — only call this "
+                "tool when ALL of the following are true: 1) the user's most "
+                "recent turn contains an explicit affirmative confirmation "
+                "such as 'ha, yubor', 'yes', 'oʻq', 'yubor', 'bor', 'jo'nat', "
+                "etc.; 2) you have, in the IMMEDIATELY PRECEDING assistant "
+                "turn, proposed the exact recipient AND exact message text "
+                "and asked 'Yuborayinmi?'. NEVER infer a send from any other "
+                "user request. If the user asked to READ messages, look up "
+                "contacts, or anything else — DO NOT call this tool. If the "
+                "user changes wording or recipient, re-propose and re-confirm "
+                "first. When in doubt, propose and ask, do not send."
             ),
             "parameters": {
                 "type": "object",
@@ -590,8 +833,11 @@ REGISTRY: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "find_timezone": find_timezone,
     "get_kunuz_news": get_kunuz_news,
     "get_weather": get_weather,
+    "play_music": play_music,
     "set_volume": set_volume,
+    "stop_music": stop_music,
     "telegram_find_contact": telegram_find_contact,
+    "telegram_read_messages": telegram_read_messages,
     "telegram_send_message": telegram_send_message,
 }
 
