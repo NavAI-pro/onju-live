@@ -244,6 +244,157 @@ async def get_kunuz_news(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ─── get_weather ────────────────────────────────────────────────────────────
+
+# Compact mapping of Open-Meteo WMO weather codes → short Uzbek descriptor.
+# The LLM sees this and phrases the actual sentence naturally.
+_WMO_UZ: dict[int, str] = {
+    0: "ochiq", 1: "asosan ochiq", 2: "qisman bulutli", 3: "bulutli",
+    45: "tumanli", 48: "qirovli tuman",
+    51: "yengil yomgir", 53: "yomgir", 55: "kuchli yomgir",
+    61: "yomgir", 63: "kuchli yomgir", 65: "juda kuchli yomgir",
+    71: "yengil qor", 73: "qor", 75: "kuchli qor",
+    77: "qor parchasi",
+    80: "yomg'irli", 81: "kuchli yomg'irli", 82: "juda kuchli yomg'irli",
+    85: "qorli", 86: "kuchli qorli",
+    95: "momaqaldiroq", 96: "do'l bilan momaqaldiroq", 99: "kuchli momaqaldiroq",
+}
+
+
+async def _geocode(client: httpx.AsyncClient, name: str) -> dict[str, Any] | None:
+    try:
+        r = await client.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": name, "count": 1, "language": "en", "format": "json"},
+            timeout=6.0,
+        )
+        r.raise_for_status()
+        results = r.json().get("results") or []
+        if not results:
+            return None
+        g = results[0]
+        return {
+            "name": g.get("name"),
+            "country": g.get("country"),
+            "lat": g["latitude"],
+            "lon": g["longitude"],
+            "tz": g.get("timezone", "auto"),
+        }
+    except Exception as e:
+        log.debug(f"geocode {name!r} failed: {e}")
+        return None
+
+
+async def get_weather(args: dict[str, Any]) -> dict[str, Any]:
+    """Return current conditions + today's / tomorrow's forecast for a city.
+
+    Data source: Open-Meteo (no API key required). LLM is expected to phrase
+    the spoken reply in Uzbek with numbers spelled out.
+    """
+    location = (args.get("location") or "").strip()
+    when = (args.get("when") or "today").strip().lower()
+    if not location:
+        return {"error": "Missing 'location' argument."}
+    if when in {"bugun", "today", ""}:
+        day_index = 0
+        day_label = "bugun"
+    elif when in {"ertaga", "tomorrow"}:
+        day_index = 1
+        day_label = "ertaga"
+    else:
+        return {"error": f"'when' must be 'today' or 'tomorrow' (got {when!r})."}
+
+    async with httpx.AsyncClient(headers={"User-Agent": "onju-voice/1.0"}) as client:
+        geo = await _geocode(client, location)
+        if not geo:
+            return {"error": f"Joy topilmadi: {location!r}"}
+
+        try:
+            r = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": geo["lat"],
+                    "longitude": geo["lon"],
+                    "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+                    "timezone": "auto",
+                    "forecast_days": 3,
+                },
+                timeout=8.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            return {"error": f"Open-Meteo so'rovi muvaffaqiyatsiz: {e}"}
+
+    cur = data.get("current") or {}
+    daily = data.get("daily") or {}
+
+    def _daily(key: str):
+        arr = daily.get(key) or []
+        return arr[day_index] if len(arr) > day_index else None
+
+    code = _daily("weather_code")
+    result = {
+        "location": geo["name"],
+        "country": geo["country"],
+        "when": day_label,
+        "current": {
+            "temperature_c": cur.get("temperature_2m"),
+            "humidity_pct": cur.get("relative_humidity_2m"),
+            "wind_kmh": cur.get("wind_speed_10m"),
+            "condition_code": cur.get("weather_code"),
+            "condition_uz": _WMO_UZ.get(cur.get("weather_code"), "noma'lum"),
+        } if day_index == 0 else None,
+        "forecast": {
+            "date": (daily.get("time") or [None, None, None])[day_index],
+            "high_c": _daily("temperature_2m_max"),
+            "low_c": _daily("temperature_2m_min"),
+            "precipitation_mm": _daily("precipitation_sum"),
+            "wind_max_kmh": _daily("wind_speed_10m_max"),
+            "condition_code": code,
+            "condition_uz": _WMO_UZ.get(code, "noma'lum"),
+        },
+    }
+    log.info(
+        f"TOOL get_weather({location!r}, when={day_label}) -> {geo['name']} "
+        f"{result['forecast']['low_c']}..{result['forecast']['high_c']}°C "
+        f"{result['forecast']['condition_uz']}"
+    )
+    return result
+
+
+# ─── telegram ───────────────────────────────────────────────────────────────
+
+async def telegram_find_contact(args: dict[str, Any]) -> dict[str, Any]:
+    """Look up Telegram contacts/chats matching a name, @username or phone."""
+    from pipeline.services import telegram as tg
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "Missing 'query'."}
+    results = await tg.find_contact(query, limit=int(args.get("limit", 5) or 5))
+    log.info(f"TOOL telegram_find_contact({query!r}) -> {len(results)} match(es)")
+    return {"query": query, "count": len(results), "matches": results}
+
+
+async def telegram_send_message(args: dict[str, Any]) -> dict[str, Any]:
+    """Send a Telegram message AS THE USER. Caller (the LLM) must verbally
+    confirm with the user before invoking this."""
+    from pipeline.services import telegram as tg
+    target = args.get("target")
+    text = (args.get("text") or "").strip()
+    if not target:
+        return {"error": "Missing 'target' (username, phone, or id)."}
+    if not text:
+        return {"error": "Missing 'text'."}
+    res = await tg.send_message(target, text)
+    if res.get("ok"):
+        log.info(f"TOOL telegram_send_message -> {res['to'].get('name')} ({len(text)} chars)")
+    else:
+        log.warning(f"TOOL telegram_send_message FAILED: {res.get('error')}")
+    return res
+
+
 # ─── set_volume ─────────────────────────────────────────────────────────────
 
 async def set_volume(args: dict[str, Any]) -> dict[str, Any]:
@@ -289,6 +440,91 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     }
                 },
                 "required": ["location"],
+            },
+        },
+    },
+    "get_weather": {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "Get current weather and today's / tomorrow's forecast for a "
+                "city. Data is from Open-Meteo. Call whenever the user asks "
+                "about ob-havo (weather), harorat (temperature), yomg'ir "
+                "(rain), shamol (wind), etc. After the tool returns, compose "
+                "a brief Uzbek reply (1-2 sentences) using the returned data; "
+                "spell every number in Uzbek words per the voice-output rules."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or place name (e.g. 'Toshkent', 'Samarqand', 'Tokyo').",
+                    },
+                    "when": {
+                        "type": "string",
+                        "enum": ["today", "tomorrow"],
+                        "description": "Default 'today'. Use 'tomorrow' for 'ertaga' / 'kelasi kun'.",
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    "telegram_find_contact": {
+        "type": "function",
+        "function": {
+            "name": "telegram_find_contact",
+            "description": (
+                "Look up a Telegram contact or chat by name, @username, or "
+                "phone number. Use FIRST when the user wants to message "
+                "someone whose Telegram identifier you don't yet know. "
+                "Returns up to N matches from recent dialogs + global search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Free-form name, @username, or phone number.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max matches (1-10). Default 5.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    "telegram_send_message": {
+        "type": "function",
+        "function": {
+            "name": "telegram_send_message",
+            "description": (
+                "Send a Telegram message AS THE USER (not a bot). HIGH-IMPACT: "
+                "the message will appear from the user's account in real time, "
+                "visible to the recipient. BEFORE calling this, ALWAYS read "
+                "back the recipient name and the proposed message text in "
+                "Uzbek and wait for an explicit confirmation like 'ha, yubor', "
+                "'yes send', or 'oʻq, yubor'. Only call after the user clearly "
+                "confirms. If the user asks to change the wording or recipient, "
+                "re-propose and re-confirm before sending."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Recipient: @username, phone, or numeric id from telegram_find_contact.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Message body, in the language requested by the user.",
+                    },
+                },
+                "required": ["target", "text"],
             },
         },
     },
@@ -353,7 +589,10 @@ SCHEMAS: dict[str, dict[str, Any]] = {
 REGISTRY: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "find_timezone": find_timezone,
     "get_kunuz_news": get_kunuz_news,
+    "get_weather": get_weather,
     "set_volume": set_volume,
+    "telegram_find_contact": telegram_find_contact,
+    "telegram_send_message": telegram_send_message,
 }
 
 

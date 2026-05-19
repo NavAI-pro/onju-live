@@ -18,6 +18,7 @@ dependencies = [
     "silero-vad",
     "pyserial",
     "google-genai",
+    "telethon",
 ]
 
 [project.urls]

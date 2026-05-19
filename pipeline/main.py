@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import time
 import warnings
@@ -400,22 +401,30 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 continue
 
             # Wake-word filter: only apply to VOX devices (PTT devices are
-            # always "intentional"). Bypassed for VOX too while the button is
-            # held (device.ptt_override) so the user can force a turn.
+            # always "intentional"). Bypassed while the button is held
+            # (device.ptt_override) or during the short follow-up window
+            # right after the assistant replied (device.in_followup) so the
+            # user can say "ha yubor" / "yes" naturally.
             ww_cfg = config.get("wake_word", {}) or {}
-            if ww_cfg.get("enabled") and not device.ptt and not device.ptt_override:
-                phrases = [p.lower() for p in (ww_cfg.get("phrases") or [])]
-                norm = text.lower()
-                hit = next((p for p in phrases if p in norm), None)
-                if not hit:
+            if ww_cfg.get("enabled") and not device.ptt and not device.ptt_override and not device.in_followup:
+                phrases = [re.escape(p.lower()) for p in (ww_cfg.get("phrases") or [])]
+                # Match phrase stems plus any trailing word characters
+                # ("muxlis" → also catches "muxlisa", "muxlisi", "muxliso", etc.)
+                # and surrounding optional "hey" plus connector punctuation.
+                # Optional leading attention word ("hey"/"ey"/"hay"/"oy") often
+                # comes back from ASR as a separate token; absorb it too.
+                pattern = re.compile(
+                    rf"(?i)\b(?:hey|ey|hay|oy)?\s*\b(?:{'|'.join(phrases)})\w*\b[\s,.!?:;'-]*",
+                )
+                m = pattern.search(text)
+                if not m:
                     log.info(f"WAKE  no match in {text!r} — dropping")
                     continue
-                # Strip wake-word + leading punctuation/connectors so the LLM
-                # sees the user's actual request.
-                idx = norm.find(hit)
-                stripped = (text[:idx] + text[idx + len(hit):]).strip(" ,.!?:;'-")
-                log.info(f"WAKE  matched {hit!r} -> {stripped!r}")
-                text = stripped or text  # if user only said the wake-word, fall back to greeting
+                stripped = (text[:m.start()] + text[m.end():]).strip(" ,.!?:;'-")
+                log.info(f"WAKE  matched {m.group(0)!r} -> {stripped!r}")
+                # If the user only called the wake-word, give the LLM a clear
+                # "I'm listening" prompt instead of feeding back its own name.
+                text = stripped or "(Foydalanuvchi sizning ismingizni chaqirdi. Qisqa, do'stona javob bering — masalan: \"Eshitaman, qanday yordam bera olaman?\")"
 
             # Check for interrupt before LLM
             if device.interrupted.is_set():
@@ -583,6 +592,11 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             if response_text:
                 device.conversation.commit(response_text)
             device.last_response = response_text
+            # Open a short follow-up window so the user can answer without
+            # re-invoking the wake-word ("ha yubor", "yo'q", clarifications).
+            # 20 s is enough for the reply audio to finish playing on the
+            # device + the user to hear it + think + speak.
+            device.followup_until = time.time() + 20.0
             elapsed = time.monotonic() - turn_t0
             ttfs = f"{first_sentence_at - turn_t0:.2f}s" if first_sentence_at else "—"
             log.info(f"LLM  [{ttfs} first / {elapsed:.2f}s total / "
@@ -810,6 +824,23 @@ async def main(config_path: str = None, do_warmup: bool = False, devices: list[s
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Silence asyncio's broken-pipe spam from the persistent LED-blink TCP
+    # connection — the device closes that socket the moment it accepts a new
+    # audio TCP, which races against our 40 Hz LED writes. We already handle
+    # the failure (close + reopen on next VAD); these log lines are noise.
+    class _DropSocketSendSpam(logging.Filter):
+        def filter(self, rec):
+            msg = rec.getMessage()
+            return not ("socket.send()" in msg or "socket.sendto()" in msg
+                        or "Fatal write error on socket transport" in msg)
+    _drop_spam = _DropSocketSendSpam()
+    # Attach to every existing handler too, in case asyncio's default
+    # exception handler bypassed our named-logger filter via the root.
+    logging.getLogger().addFilter(_drop_spam)
+    logging.getLogger("asyncio").addFilter(_drop_spam)
+    for h in logging.getLogger().handlers:
+        h.addFilter(_drop_spam)
 
     manager = DeviceManager(config)
 

@@ -49,6 +49,13 @@ volatile bool pttActive = false;
 volatile bool isPlaying = false;
 volatile bool interruptPlayback = false;
 volatile uint32_t forceMicUntil = 0; // serial 'M' command sets this
+// Set by the TCP audio handler (Core 0) when it wants to play back audio.
+// micTask (Core 1) owns I2S mode switches — it sees this flag, breaks out
+// of i2s_read(), switches the driver to MODE_SPEAKER, and the handler
+// blocks on `currentMode == MODE_SPEAKER` before touching the speaker.
+// This prevents `i2s_driver_uninstall()` from yanking the driver out from
+// under a blocked `i2s_read(... portMAX_DELAY)` on the other core.
+volatile bool playbackRequested = false;
 uint8_t speaker_volume = DEFAULT_VOLUME;
 bool ledEnabled = true;
 
@@ -87,8 +94,15 @@ volatile uint8_t ledFade = 5;
 
 void initMicI2S()
 {
-    if (currentMode != MODE_NONE)
+    if (currentMode != MODE_NONE) {
+        // Drain DMA + stop before uninstall — switching from TX (speaker)
+        // to PDM RX (mic) corrupts driver state without these steps,
+        // causing the next i2s_read() to block forever.
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        i2s_stop(I2S_NUM_0);
         i2s_driver_uninstall(I2S_NUM_0);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 
     i2s_config_t cfg = {};
     cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
@@ -113,8 +127,12 @@ void initMicI2S()
 
 void initSpeakerI2S()
 {
-    if (currentMode != MODE_NONE)
+    if (currentMode != MODE_NONE) {
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        i2s_stop(I2S_NUM_0);
         i2s_driver_uninstall(I2S_NUM_0);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 
     i2s_config_t cfg = {};
     cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -395,6 +413,7 @@ void opusDecodeTask(void *param)
 
     i2s_zero_dma_buffer(I2S_NUM_0);
     isPlaying = false;
+    playbackRequested = false;  // release the mic-lockout in micTask
     Serial.println("Opus: connection closed");
     opusTaskRunning = false;
     vTaskDelete(NULL);
@@ -427,15 +446,27 @@ void micTask(void *param)
         pttActive = buttonDown;  // kept for compatibility (LED feedback, etc.)
         prevButton = buttonDown;
 
-        // Always-on mic: capture continuously except when the speaker is
-        // playing audio (PDM mic and I2S speaker share pins on M5 Echo).
-        bool micActive = !isPlaying;
+        // Always-on mic: capture continuously except when the audio handler
+        // wants the speaker. ALL i2s_driver_install/uninstall happens HERE
+        // on Core 1 — the audio handler on Core 0 sets `playbackRequested`
+        // and blocks until `currentMode == MODE_SPEAKER`. This avoids
+        // racing the driver against a blocked `i2s_read(... portMAX_DELAY)`.
+        // Hold speaker mode for 500ms after each chunk ends — any new
+        // partial arriving in that window re-asserts playbackRequested.
+        static uint32_t mic_resume_at = 0;
+        bool micActive;
+        if (playbackRequested || isPlaying) {
+            mic_resume_at = millis() + 500;
+            micActive = false;
+        } else {
+            micActive = ((int32_t)(millis() - mic_resume_at) >= 0);
+        }
 
         if (micActive && currentMode != MODE_MIC)
         {
             initMicI2S();
         }
-        if (!micActive && currentMode == MODE_MIC)
+        if (!micActive && currentMode != MODE_SPEAKER)
         {
             initSpeakerI2S();
         }
@@ -735,7 +766,13 @@ void loop()
 
         Serial.printf("Audio: compression=%d vol=%d\n", compression_type, speaker_volume);
 
-        if (currentMode != MODE_SPEAKER) initSpeakerI2S();
+        // Hand off mode switching to micTask (Core 1) — it owns the I2S
+        // driver. Wait up to 200ms for it to switch; bail if it doesn't.
+        playbackRequested = true;
+        uint32_t waitStart = millis();
+        while (currentMode != MODE_SPEAKER && (millis() - waitStart) < 200) {
+            vTaskDelay(1);
+        }
 
         isPlaying = true;
         interruptPlayback = false;

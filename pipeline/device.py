@@ -37,6 +37,10 @@ class Device:
         # bumped to now+2.0s so any utterance Silero VAD is still chunking at
         # the trailing edge of the press still gets the bypass.
         self.ptt_override_until: float = 0.0
+        # Follow-up window: after each assistant reply we briefly accept the
+        # next utterance without requiring the wake-word, so the user can say
+        # "ha yubor" / "yes send" / a quick clarification naturally.
+        self.followup_until: float = 0.0
 
         # PTT state
         self.ptt_buffer: list = []  # raw PCM frames during PTT
@@ -46,6 +50,10 @@ class Device:
     @property
     def ptt_override(self) -> bool:
         return time.time() < self.ptt_override_until
+
+    @property
+    def in_followup(self) -> bool:
+        return time.time() < self.followup_until
 
     def to_dict(self) -> dict:
         return {
