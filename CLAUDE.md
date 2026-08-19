@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Wider context: the NavAI estate
+
+This repository is one of six. Cross-repo context — what the other services are,
+which handle personal data, who owns what, and what has already been decided —
+lives in the shared context repo:
+
+**https://github.com/NavAI-pro/navai-context**
+
+Read its `inventory.yaml` first if your task touches anything beyond this repo.
+Its `AGENTS.md` carries the rules that apply everywhere: tenant isolation, no
+personal data in logs, and how to record what you learn so the next person does
+not rediscover it.
+
 ## What this repo is
 
 Onju Voice v2 (OnjuClaw) — a server pipeline plus ESP32 firmware that turns a Google-Nest-Mini-form-factor speaker (custom PCB `onjuino` or off-the-shelf `m5_echo`) into a voice front-end for an LLM or agent. Devices stream mu-law audio over UDP to the server; the server runs VAD → ASR → LLM → TTS → Opus → TCP back to the speaker.
