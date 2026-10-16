@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 
 import httpx
 import numpy as np
@@ -10,6 +11,28 @@ from scipy.io import wavfile
 from pipeline.audio import resample_pcm_int16
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_env(value: str) -> str:
+    """Expand ${VAR} references against the environment."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
+
+
+def _navai_ws_kwargs(cfg: dict, config: dict) -> dict:
+    """Map the `tts.navai_uz` config block onto navai_ws's TTS options."""
+    return dict(
+        ws_url=_resolve_env(cfg["ws_url"]),
+        api_key=_resolve_env(cfg.get("api_key", "") or ""),
+        voice_id=cfg.get("voice_id", "muxlisa"),
+        target_rate=config["audio"]["sample_rate"],
+        timeout=float(cfg.get("timeout", 60)),
+        speed=float(cfg.get("speed", 1.0)),
+        mode=cfg.get("mode") or None,
+        reference_text=cfg.get("reference_text") or None,
+        language=cfg.get("language", "uz"),
+    )
 
 
 async def synthesize(text: str, voice: str, config: dict) -> bytes:
@@ -22,6 +45,23 @@ async def synthesize(text: str, voice: str, config: dict) -> bytes:
     if backend == "navai_uz":
         return await _navai_uz(text, config)
     raise ValueError(f"Unknown TTS backend: {backend}")
+
+
+async def synthesize_stream(text: str, voice: str, config: dict):
+    """Async generator yielding PCM16 @ audio.sample_rate in chunks as they're
+    produced. For the NavAI WebSocket backend this streams incrementally (first
+    audio ~0.5s); every other backend yields a single buffered chunk so callers
+    can use one code path."""
+    tts_cfg = config["tts"]
+    if tts_cfg["backend"] == "navai_uz" and tts_cfg["navai_uz"].get("ws_url"):
+        from pipeline.services import navai_ws
+        cfg = tts_cfg["navai_uz"]
+        async for pcm in navai_ws.synthesize_ws_stream(
+            text, **_navai_ws_kwargs(cfg, config),
+        ):
+            yield pcm
+    else:
+        yield await synthesize(text, voice, config)
 
 
 async def _elevenlabs(text: str, voice_name: str, config: dict) -> bytes:
@@ -63,6 +103,14 @@ async def _navai_uz(text: str, config: dict) -> bytes:
     the voice-cloning slots (left empty when using a pre-loaded voice).
     """
     cfg = config["tts"]["navai_uz"]
+
+    # WebSocket transport (gateway streaming synth) when ws_url is configured.
+    if cfg.get("ws_url"):
+        from pipeline.services import navai_ws
+        return await navai_ws.synthesize_ws(text, **_navai_ws_kwargs(cfg, config))
+
+    from pipeline.services.navai_ws import prepare_tts_text
+    text = prepare_tts_text(text, cfg.get("language", "uz"))
     url = cfg["url"].rstrip("/") + cfg.get("path", "/synthesize/local")
     files = {
         "target_text": (None, text),
@@ -75,8 +123,10 @@ async def _navai_uz(text: str, config: dict) -> bytes:
     files["reference_audio"] = (None, cfg.get("reference_audio", ""))
     files["reference_text"] = (None, cfg.get("reference_text", ""))
     timeout = float(cfg.get("timeout", 60))
+    key = _resolve_env(cfg.get("api_key", "") or "")
+    headers = {"X-API-Key": key} if key else {}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, files=files)
+        resp = await client.post(url, files=files, headers=headers)
         resp.raise_for_status()
         wav_bytes = resp.content
 
