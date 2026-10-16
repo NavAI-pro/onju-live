@@ -395,7 +395,7 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             try:
                 asr_result = await asr.transcribe(pcm_bytes, config)
             except Exception as e:
-                log.error(f"ASR  failed ({config['asr']['url']}): {e}")
+                log.error(f"ASR  failed ({config['asr'].get('ws_url', config['asr'].get('url', '?'))}): {e}")
                 continue
             text = asr_result.get("text", "").strip()
             nsp = asr_result.get("no_speech_prob")
@@ -442,25 +442,29 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                 device.ptt_override
                 or (device.in_followup and not music_active)
             )
-            if ww_cfg.get("enabled") and not device.ptt and not bypass_wake:
+            if ww_cfg.get("enabled") and not device.ptt:
                 phrases = [re.escape(p.lower()) for p in (ww_cfg.get("phrases") or [])]
                 # Match phrase stems plus any trailing word characters
                 # ("muxlis" → also catches "muxlisa", "muxlisi", "muxliso", etc.)
                 # and surrounding optional "hey" plus connector punctuation.
-                # Optional leading attention word ("hey"/"ey"/"hay"/"oy") often
-                # comes back from ASR as a separate token; absorb it too.
                 pattern = re.compile(
                     rf"(?i)\b(?:hey|ey|hay|oy)?\s*\b(?:{'|'.join(phrases)})\w*\b[\s,.!?:;'-]*",
                 )
                 m = pattern.search(text)
-                if not m:
+                if m:
+                    # ALWAYS strip the wake word when present — even during a
+                    # follow-up/PTT bypass — so it never leaks into the query
+                    # (e.g. "muxlisa bugun havo" must not become weather for a
+                    # city named "Muxlisa").
+                    stripped = (text[:m.start()] + text[m.end():]).strip(" ,.!?:;'-")
+                    log.info(f"WAKE  matched {m.group(0)!r} -> {stripped!r}")
+                    # If only the wake-word was said, prompt the LLM to greet.
+                    text = stripped or "(Foydalanuvchi sizning ismingizni chaqirdi. Qisqa, do'stona javob bering — masalan: \"Eshitaman, qanday yordam bera olaman?\")"
+                elif not bypass_wake:
                     log.info(f"WAKE  no match in {text!r} — dropping")
                     continue
-                stripped = (text[:m.start()] + text[m.end():]).strip(" ,.!?:;'-")
-                log.info(f"WAKE  matched {m.group(0)!r} -> {stripped!r}")
-                # If the user only called the wake-word, give the LLM a clear
-                # "I'm listening" prompt instead of feeding back its own name.
-                text = stripped or "(Foydalanuvchi sizning ismingizni chaqirdi. Qisqa, do'stona javob bering — masalan: \"Eshitaman, qanday yordam bera olaman?\")"
+                # else: no wake word but in a bypass window (follow-up/PTT) —
+                # keep the utterance as-is (natural continuation like "ha, yubor").
 
             # Check for interrupt before LLM
             if device.interrupted.is_set():
@@ -481,32 +485,57 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
             stream_start_at: float | None = None
 
             async def send_sentence(sentence: str, is_final: bool) -> bool:
-                """Synthesize, encode, and push one sentence. Returns True on
-                success, False if interrupted or TTS failed."""
+                """Stream one sentence to the device: TTS chunks are Opus-encoded
+                and pushed AS they arrive, so playback starts ~0.5s in instead of
+                after the whole sentence. Short answers keep gaps negligible.
+                Returns True on success, False on interrupt / TTS failure."""
                 nonlocal sent_partial
                 if device.interrupted.is_set():
-                    log.info(f"Interrupted before TTS")
+                    log.info("Interrupted before TTS")
                     return False
+                mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
+                volume_byte = max(0, min(20, round(device.volume / 5)))   # 0..100 -> 0..20
+                # The device plays one stream at a time and its loop is blocked
+                # while playing, so retry the connect until it's free.
+                writer = None
+                connect_deadline = time.monotonic() + 12.0
+                while writer is None and time.monotonic() < connect_deadline:
+                    if device.interrupted.is_set():
+                        return False
+                    writer = await open_audio_stream(device.ip, tcp_port,
+                                                     mic_timeout=mic_timeout,
+                                                     volume=volume_byte,
+                                                     fade=dev_cfg["led_fade"],
+                                                     timeout=1.0)
+                    if writer is None:
+                        await asyncio.sleep(0.2)
+                if writer is None:
+                    log.error("TTS: could not open audio stream to device")
+                    return False
+                n_frames = 0
+                first_logged = False
                 try:
-                    pcm = await tts.synthesize(sentence, device.voice, config)
+                    async for pcm in tts.synthesize_stream(sentence, device.voice, config):
+                        if device.interrupted.is_set():
+                            log.info("Interrupted mid-TTS")
+                            return False
+                        if not pcm:
+                            continue
+                        frames = opus_encode(pcm, sample_rate, opus_frame_size)
+                        if not first_logged:
+                            first_logged = True
+                            log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] first audio "
+                                     f"({'final' if is_final else 'partial'}: {sentence!r})")
+                        if not await write_opus_frames_stream(writer, frames):
+                            return False
+                        n_frames += len(frames)
                 except Exception as e:
                     log.error(f"TTS  failed: {e}")
                     return False
-                if device.interrupted.is_set():
-                    log.info(f"Interrupted before send")
+                finally:
+                    await close_audio_stream(writer)
+                if n_frames == 0:
                     return False
-                frames = opus_encode(pcm, sample_rate, opus_frame_size)
-                payload = opus_frames_to_tcp_payload(frames)
-                mic_timeout = dev_cfg["default_mic_timeout"] if is_final else 0
-                log.info(f"SEND  [+{time.monotonic() - turn_t0:.2f}s] "
-                         f"{len(frames)} opus frames to {device.ip} "
-                         f"({'final' if is_final else 'partial'}: {sentence!r})")
-                # device.volume is 0..100; firmware native range is 0..20.
-                volume_byte = max(0, min(20, round(device.volume / 5)))
-                await send_audio(device.ip, tcp_port, payload,
-                                 mic_timeout=mic_timeout,
-                                 volume=volume_byte,
-                                 fade=dev_cfg["led_fade"])
                 if not is_final:
                     sent_partial = True
                 return True
@@ -522,34 +551,51 @@ async def process_utterances(config: dict, manager: DeviceManager, utterance_que
                     except Exception:
                         pass
 
-            # Stall decision (agentic mode only; blocking, capped by config timeout).
-            # Passes the previous exchange so the classifier can recognize
-            # continuations ("go on") and prefaces ("one more thing") as
-            # conversational rather than tool-needing.
-            stall_text: str | None = None
-            if config["conversation"].get("backend") == "agentic":
-                stall_text = await stall_mod.decide_stall(
-                    text,
-                    config,
-                    prev_user=device.last_user_text,
-                    prev_assistant=device.last_response,
-                )
-                stall_decided_at = time.monotonic() - turn_t0
-                if stall_text:
-                    log.info(f"STALL [+{stall_decided_at:.2f}s] decided: {stall_text!r}")
-                else:
-                    log.info(f"STALL [+{stall_decided_at:.2f}s] NONE")
-            device.last_user_text = text
+            # Stall / "agent distraction": a short spoken filler so the user
+            # isn't met with silence while a tool call / lookup runs.
+            #   • agentic — decide FIRST (blocking), play in parallel.
+            #   • conversational+tools — decide CONCURRENTLY with the stream so
+            #     no-tool turns pay zero extra latency (the classifier resolves
+            #     to NONE fast); on a tool turn the stream blocks during the tool
+            #     round and the filler plays in that gap.
+            conv_cfg = config["conversation"]
+            backend = conv_cfg.get("backend")
+            stall_cfg = conv_cfg.get("stall", {})
+            conv_has_tools = (
+                backend == "conversational"
+                and bool(conv_cfg.get("conversational", {}).get("tools"))
+            )
+            stall_on = stall_cfg.get("enabled") and (backend == "agentic" or conv_has_tools)
+            prev_user, prev_assistant = device.last_user_text, device.last_response
 
-            # Fire stall TTS+send in parallel with OpenClaw warming up.
+            stall_text: str | None = None
             stall_task: asyncio.Task | None = None
             extra_context: str | None = None
-            if stall_text:
-                stall_task = asyncio.create_task(send_sentence(stall_text, is_final=False))
-                extra_context = (
-                    f"(You already said aloud to the user: \"{stall_text}\" — "
-                    f"don't repeat this phrase, continue naturally with the answer.)"
+
+            if stall_on and backend == "agentic":
+                stall_text = await stall_mod.decide_stall(
+                    text, config, prev_user=prev_user, prev_assistant=prev_assistant,
                 )
+                stall_decided_at = time.monotonic() - turn_t0
+                log.info(f"STALL [+{stall_decided_at:.2f}s] "
+                         f"{'decided: ' + repr(stall_text) if stall_text else 'NONE'}")
+                if stall_text:
+                    stall_task = asyncio.create_task(send_sentence(stall_text, is_final=False))
+                    extra_context = (
+                        f"(You already said aloud to the user: \"{stall_text}\" — "
+                        f"don't repeat this phrase, continue naturally with the answer.)"
+                    )
+            elif stall_on and conv_has_tools:
+                async def _stall_flow(u=text, pu=prev_user, pa=prev_assistant):
+                    phrase = await stall_mod.decide_stall(u, config, prev_user=pu, prev_assistant=pa)
+                    # Short fillers are fine: navai_ws pads text under the
+                    # gateway's 5-char minimum.
+                    if phrase:
+                        log.info(f"STALL (conv) playing: {phrase!r}")
+                        await send_sentence(phrase, is_final=False)
+                stall_task = asyncio.create_task(_stall_flow())
+
+            device.last_user_text = text
 
             aborted = False
             _device_ctx_token = _current_device_ctx.set(device)
@@ -784,7 +830,7 @@ def _log_startup_summary(config: dict) -> None:
     backend_cfg = conv_cfg.get(backend_name, {})
 
     log.info("Pipeline server starting")
-    log.info(f"  ASR   {config['asr']['url']}")
+    log.info(f"  ASR   {config['asr'].get('ws_url', config['asr'].get('url', '?'))}")
 
     if backend_name == "agentic":
         model = backend_cfg.get("provider_model") or backend_cfg.get("model", "?")

@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 
 import httpx
 import numpy as np
@@ -6,6 +8,19 @@ import numpy as np
 from pipeline.audio import pcm_to_wav
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_env(value: str) -> str:
+    """Expand ${VAR} references against the environment."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
+
+
+def _auth_headers(asr_cfg: dict) -> dict:
+    """X-API-Key header if an api_key is configured (NavAI gateway)."""
+    key = _resolve_env(asr_cfg.get("api_key", "") or "")
+    return {"X-API-Key": key} if key else {}
 
 
 async def transcribe(pcm_int16_bytes: bytes, config: dict) -> dict:
@@ -24,6 +39,17 @@ async def transcribe(pcm_int16_bytes: bytes, config: dict) -> dict:
     endpoint = asr_cfg.get("endpoint", "parakeet")
     sample_rate = config["audio"]["sample_rate"]
 
+    if endpoint == "navai-ws":
+        from pipeline.services import navai_ws
+        return await navai_ws.transcribe_ws(
+            pcm_int16_bytes,
+            ws_url=_resolve_env(asr_cfg["ws_url"]),
+            api_key=_resolve_env(asr_cfg.get("api_key", "")),
+            language=asr_cfg.get("language", "uz"),
+            sample_rate=sample_rate,
+            timeout=float(asr_cfg.get("timeout", 30)),
+        )
+
     wav_bytes = pcm_to_wav(np.frombuffer(pcm_int16_bytes, dtype=np.int16), rate=sample_rate)
     base_url = asr_cfg["url"].rstrip("/")
 
@@ -33,7 +59,7 @@ async def transcribe(pcm_int16_bytes: bytes, config: dict) -> dict:
         data = {"languages": asr_cfg.get("language", "uz")}
         timeout = float(asr_cfg.get("timeout", 30))
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, files=files, data=data)
+            resp = await client.post(url, files=files, data=data, headers=_auth_headers(asr_cfg))
             resp.raise_for_status()
             arr = resp.json()
         # API returns a list (one entry per file); take the first.

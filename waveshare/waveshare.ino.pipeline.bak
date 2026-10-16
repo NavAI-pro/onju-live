@@ -1,0 +1,328 @@
+// Waveshare ESP32-S3-Touch-LCD-1.85 (audio variant) — onju voice front-end.
+//
+// Streams mic audio (mu-law over UDP) to the onju server and plays the server's
+// Opus reply (over TCP) on the speaker. VOX / always-on mic; the server runs
+// VAD + wake word. This is the full pipeline port of the m5_echo firmware, with
+// the audio layer replaced by this board's ES7210 mic + ES8311 speaker on a
+// shared full-duplex I2S bus (see BRINGUP_NOTES.md).
+//
+// Audio pins:  MCLK=2, BCK=48, WS=38, DOUT=47(->ES8311), DIN=39(<-ES7210).
+// I2C:         SDA=11, SCL=10.  MCLK = 256 * sample_rate.
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <esp_mac.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <opus.h>
+#include "ESP_I2S.h"
+#include "es7210.h"
+#include "es8311.h"
+#include "credentials.h"
+#include "audio_compression.h"
+
+#if __has_include("git_hash.h")
+#include "git_hash.h"
+#else
+#define GIT_HASH "------"
+#endif
+
+// ─── Audio pins / format ────────────────────────────────────
+#define I2S_MCK_PIN  GPIO_NUM_2
+#define I2S_BCK_PIN  GPIO_NUM_48
+#define I2S_WS_PIN   GPIO_NUM_38
+#define I2S_DOUT_PIN GPIO_NUM_47
+#define I2S_DIN_PIN  GPIO_NUM_39
+#define I2C_SDA_PIN  GPIO_NUM_11
+#define I2C_SCL_PIN  GPIO_NUM_10
+
+#define SAMPLE_RATE   16000
+#define MCLK_MULT     256
+#define MCLK_FREQ     (SAMPLE_RATE * MCLK_MULT)
+#define SAMPLE_CHUNK  512               // 32ms @16k — matches server VAD frame
+#define MIC_GAIN      12                // ES7210 output is modest; boost before send
+
+#define HOST_NAME     "ws-audio"
+#define DEFAULT_SERVER "default.server.com"
+#define DEFAULT_VOLUME 85               // ES8311 volume 0..100
+#define MIN_PLAY_VOLUME 75              // never play quieter than this
+
+// ─── Opus ───────────────────────────────────────────────────
+#define OPUS_FRAME_SIZE 320             // 20ms @16k
+#define OPUS_MAX_PACKET 4000
+
+// ─── Globals ────────────────────────────────────────────────
+I2SClass i2s;
+static es7210_dev_handle_t es7210_handle = NULL;
+static es8311_handle_t es8311_handle = NULL;
+
+Preferences preferences;
+WiFiUDP udp;
+WiFiServer tcpServer(3001);
+WiFiClient audioClient;
+
+String wifi_ssid, wifi_password, server_hostname;
+char desired_hostname[32];
+IPAddress serverIP(0, 0, 0, 0);
+int speaker_volume = DEFAULT_VOLUME;
+
+OpusDecoder *opus_decoder = NULL;
+int16_t opus_pcm_buffer[OPUS_FRAME_SIZE];
+uint8_t opus_packet_buffer[OPUS_MAX_PACKET];
+
+
+int16_t micStereo[SAMPLE_CHUNK * 2];    // interleaved L/R from I2S
+int16_t micMono[SAMPLE_CHUNK];          // one channel, processed
+uint8_t micUlaw[SAMPLE_CHUNK];          // mu-law for UDP
+
+// ─── Codec init ─────────────────────────────────────────────
+void es7210_mic_init() {
+  es7210_i2c_config_t ic = {};
+  ic.i2c_port = I2C_NUM_0;
+  ic.i2c_addr = ES7210_ADDRRES_00;      // 0x40
+  if (es7210_new_codec(&ic, &es7210_handle) != ESP_OK) { Serial.println("ES7210 create FAIL"); return; }
+  es7210_codec_config_t cc = {};
+  cc.sample_rate_hz = SAMPLE_RATE;
+  cc.mclk_ratio = MCLK_MULT;
+  cc.i2s_format = ES7210_I2S_FMT_I2S;
+  cc.bit_width = ES7210_I2S_BITS_16B;
+  cc.mic_bias = ES7210_MIC_BIAS_2V87;
+  cc.mic_gain = ES7210_MIC_GAIN_36DB;
+  esp_err_t r = es7210_config_codec(es7210_handle, &cc);
+  es7210_config_volume(es7210_handle, 90);
+  Serial.printf("ES7210 mic init: %s\n", r == ESP_OK ? "OK" : "FAIL");
+}
+
+void es8311_spk_init() {
+  es8311_handle = es8311_create(I2C_NUM_0, ES8311_ADDRRES_0);   // 0x18
+  if (!es8311_handle) { Serial.println("ES8311 create FAIL"); return; }
+  es8311_clock_config_t clk = {};
+  clk.mclk_inverted = false;
+  clk.sclk_inverted = false;
+  clk.mclk_from_mclk_pin = true;
+  clk.mclk_frequency = MCLK_FREQ;
+  clk.sample_frequency = SAMPLE_RATE;
+  esp_err_t r = es8311_init(es8311_handle, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+  es8311_voice_volume_set(es8311_handle, speaker_volume, NULL);
+  es8311_microphone_config(es8311_handle, false);
+  Serial.printf("ES8311 speaker init: %s\n", r == ESP_OK ? "OK" : "FAIL");
+}
+
+void initAudio() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+  es8311_spk_init();
+  es7210_mic_init();
+  i2s.setPins(I2S_BCK_PIN, I2S_WS_PIN, I2S_DOUT_PIN, I2S_DIN_PIN, I2S_MCK_PIN);
+  i2s.setTimeout(1000);
+  bool ok = i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+  Serial.printf("I2S begin: %s\n", ok ? "OK" : "FAIL");
+}
+
+// ─── Config (NVS) ───────────────────────────────────────────
+void loadConfig() {
+  preferences.begin("ws-cfg", true);
+  wifi_ssid = preferences.getString("wifi_ssid", WIFI_SSID);
+  wifi_password = preferences.getString("wifi_pass", WIFI_PASSWORD);
+  server_hostname = preferences.getString("server", DEFAULT_SERVER);
+  speaker_volume = preferences.getUChar("volume", DEFAULT_VOLUME);
+  uint32_t savedIP = preferences.getUInt("server_ip", 0);
+  preferences.end();
+  if (savedIP != 0) serverIP = IPAddress(savedIP);
+  Serial.printf("SSID:%s Server:%s Vol:%d SavedIP:%s\n", wifi_ssid.c_str(),
+                server_hostname.c_str(), speaker_volume, serverIP.toString().c_str());
+}
+
+void saveConfig() {
+  preferences.begin("ws-cfg", false);
+  preferences.putString("wifi_ssid", wifi_ssid);
+  preferences.putString("wifi_pass", wifi_password);
+  preferences.putString("server", server_hostname);
+  preferences.putUChar("volume", speaker_volume);
+  preferences.end();
+}
+
+void enterConfigMode() {
+  Serial.println("Config mode. Commands: ssid, pass, server, volume, exit, cancel");
+  while (true) {
+    if (!Serial.available()) continue;
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "exit")            { saveConfig(); Serial.println("Saved. Restarting..."); delay(500); ESP.restart(); }
+    else if (cmd == "cancel")     { Serial.println("Cancelled. Restarting..."); delay(500); ESP.restart(); }
+    else if (cmd.startsWith("ssid "))   { wifi_ssid = cmd.substring(5); Serial.println("SSID: " + wifi_ssid); }
+    else if (cmd.startsWith("pass "))   { wifi_password = cmd.substring(5); Serial.println("Password updated"); }
+    else if (cmd.startsWith("server ")) { server_hostname = cmd.substring(7); Serial.println("Server: " + server_hostname); }
+    else if (cmd.startsWith("volume ")) { speaker_volume = constrain(cmd.substring(7).toInt(), 0, 100); Serial.printf("Volume: %d\n", speaker_volume); }
+    else Serial.println("Unknown command");
+  }
+}
+
+// ─── Mic: read I2S -> mu-law -> UDP (called from loop, single-task) ─────────
+// Everything touches I2S from ONE task (loop) so mic-read and playback never
+// contend on the shared full-duplex bus.
+void pumpMic() {
+  static float dc = 0.0f;
+  size_t br = i2s.readBytes((char *)micStereo, sizeof(micStereo));   // blocks ~32ms
+  int frames = br / (sizeof(int16_t) * 2);
+  if (serverIP == IPAddress(0, 0, 0, 0)) return;
+  for (int i = 0; i < frames; i++) {
+    int32_t l = micStereo[i * 2];
+    dc += 0.001f * (l - dc);
+    int32_t s = (int32_t)((l - (int32_t)dc) * MIC_GAIN);
+    if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+    micMono[i] = (int16_t)s;
+  }
+  encode_ulaw(micMono, micUlaw, frames);
+  udp.beginPacket(serverIP, 3000);
+  udp.write(micUlaw, frames);
+  udp.endPacket();
+}
+
+// ─── Opus playback (server -> speaker) ──────────────────────
+void playOpusStream(WiFiClient &client) {
+  int frameCount = 0;
+  Serial.println("Playback start");
+
+  while (client.connected() || client.available()) {
+    if (client.available() < 2) {
+      if (!client.connected()) break;
+      delay(1);
+      continue;
+    }
+    uint8_t lb[2];
+    client.read(lb, 2);
+    uint16_t frame_len = (lb[0] << 8) | lb[1];
+    if (frame_len == 0) { Serial.println("End of speech"); break; }
+    if (frame_len > OPUS_MAX_PACKET) { Serial.printf("Bad opus len %d\n", frame_len); break; }
+
+    size_t got = 0;
+    while (got < frame_len && (client.connected() || client.available())) {
+      int a = client.available();
+      if (a > 0) got += client.read(opus_packet_buffer + got, min(a, (int)(frame_len - got)));
+      else delay(1);
+    }
+    if (got < frame_len) break;
+
+    int n = opus_decode(opus_decoder, opus_packet_buffer, frame_len, opus_pcm_buffer, OPUS_FRAME_SIZE, 0);
+    if (n < 0) { Serial.printf("Opus decode err %d\n", n); continue; }
+    if (frameCount++ < 3) Serial.printf("Opus frame %d: %d samples\n", frameCount, n);
+
+    // Duplicate mono -> stereo for the ES8311 (fed via the shared I2S TX).
+    static int16_t out[OPUS_FRAME_SIZE * 2];
+    for (int i = 0; i < n; i++) { out[i * 2] = opus_pcm_buffer[i]; out[i * 2 + 1] = opus_pcm_buffer[i]; }
+    i2s.write((uint8_t *)out, n * 2 * sizeof(int16_t));
+  }
+  Serial.println("Playback done");
+}
+
+// ─── Setup ──────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+  Serial.println("\n=== ws-audio onju front-end ===");
+
+  initAudio();
+
+  // CONTINUOUS TONE — plays forever right at boot so there's no timing to miss.
+  // If you hear this, i2s.write() works in this firmware. (Diagnostic — remove
+  // after.)
+  {
+    static int16_t t[320 * 2];
+    float ph = 0.0f;
+    Serial.println("CONTINUOUS TONE (diagnostic) — you should hear a steady tone");
+    while (1) {
+      for (int i = 0; i < 320; i++) {
+        int16_t s = (int16_t)(sinf(ph) * 9000);
+        ph += 2.0f * 3.14159265f * 660.0f / SAMPLE_RATE;
+        if (ph > 6.2831853f) ph -= 6.2831853f;
+        t[i * 2] = s; t[i * 2 + 1] = s;
+      }
+      i2s.write((uint8_t *)t, sizeof(t));
+    }
+  }
+
+  loadConfig();
+
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(desired_hostname, sizeof(desired_hostname), "%s-%02X%02X%02X", HOST_NAME, mac[3], mac[4], mac[5]);
+  WiFi.setHostname(desired_hostname);
+  Serial.printf("Hostname: %s  Git: %s\n", desired_hostname, GIT_HASH);
+
+  WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300); Serial.print(".");
+    if (Serial.available()) { char c = Serial.read(); if (c == 'r') ESP.restart(); if (c == 'c') { Serial.println(); enterConfigMode(); } }
+  }
+  Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
+
+  udp.begin(3000);
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);
+  MDNS.begin(desired_hostname);
+
+  if (serverIP == IPAddress(0, 0, 0, 0) && server_hostname != DEFAULT_SERVER) {
+    String q = server_hostname; if (q.endsWith(".local")) q = q.substring(0, q.length() - 6);
+    for (int i = 0; i < 10; i++) { IPAddress r = MDNS.queryHost(q.c_str()); if (r != INADDR_NONE) { serverIP = r; break; } delay(200); }
+  }
+
+  udp.beginPacket(IPAddress(239, 0, 0, 1), 12345);
+  String announce = String(desired_hostname) + " " + String(GIT_HASH);
+  udp.write((const uint8_t *)announce.c_str(), announce.length());
+  udp.endPacket();
+  Serial.println("Announced on multicast (VOX)");
+
+  int oe;
+  opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &oe);
+  Serial.println(oe == OPUS_OK ? "Opus decoder ready" : "Opus decoder FAIL");
+
+  Serial.printf("Device: %s @ %s (%s)\nReady.\n", desired_hostname, WiFi.localIP().toString().c_str(), GIT_HASH);
+}
+
+// ─── Main loop: single task owns I2S — mic pump + TCP playback ──────────────
+void loop() {
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'r') ESP.restart();
+    else if (ch == 'c') enterConfigMode();
+  }
+
+  WiFiClient client = tcpServer.available();
+  if (!client) {
+    pumpMic();          // no incoming audio -> read mic + send upstream
+    return;
+  }
+
+  if (serverIP != client.remoteIP()) {
+    serverIP = client.remoteIP();
+    preferences.begin("ws-cfg", false);
+    preferences.putUInt("server_ip", (uint32_t)serverIP);
+    preferences.end();
+    Serial.println("Server IP learned: " + serverIP.toString());
+  }
+
+  uint32_t waitStart = millis();
+  while (client.available() < 6) {
+    if ((millis() - waitStart) > 2000) { client.stop(); return; }
+    delay(1);
+  }
+  uint8_t header[6];
+  client.read(header, 6);
+
+  if (header[0] == 0xAA) {              // audio playback
+    uint8_t vol = header[3];           // server volume 0..20
+    uint8_t compression = header[5];
+    int v = constrain((int)vol * 5, MIN_PLAY_VOLUME, 100);   // -> ES8311, with floor
+    if (v != speaker_volume) { speaker_volume = v; es8311_voice_volume_set(es8311_handle, v, NULL); }
+    if (compression == 2 && opus_decoder) {
+      playOpusStream(client);
+    }
+    client.stop();
+  } else {
+    // 0xBB/0xCC/0xDD (LED / mic-timeout) — no LEDs on this board; just ack.
+    client.stop();
+  }
+}

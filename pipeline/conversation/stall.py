@@ -47,7 +47,9 @@ async def decide_stall(
     can recognize follow-ups, continuation cues ("go on"), and mid-conversation
     prefaces ("one more thing") as conversational rather than tool-needing."""
     conv_cfg = config.get("conversation", {})
-    if conv_cfg.get("backend") != "agentic":
+    # Runs for agentic (OpenClaw buffers the first turn) and for the
+    # conversational backend when it has tools (tool rounds stall the stream).
+    if conv_cfg.get("backend") not in ("agentic", "conversational"):
         return None
 
     cfg = conv_cfg.get("stall")

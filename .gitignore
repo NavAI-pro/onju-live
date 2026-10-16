@@ -33,3 +33,4 @@ logs/
 
 # Claude
 .claude/
+waveshare/secrets.h

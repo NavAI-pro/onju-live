@@ -22,6 +22,14 @@ case "$TARGET" in
         INO_NAME="m5_echo.ino"
         PORT_GLOBS=("/dev/cu.usbserial-*" "/dev/cu.usbmodem*")
         ;;
+    waveshare|ws)
+        # Waveshare ESP32-S3-AUDIO-Board (ESP32-S3R8: 8MB octal PSRAM, 16MB flash,
+        # ES8311 speaker codec + ES7210 mic ADC + TCA9555 IO expander).
+        FQBN="esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,UploadSpeed=921600"
+        PROJECT_DIR="$REPO/waveshare"
+        INO_NAME="waveshare.ino"
+        PORT_GLOBS=("/dev/cu.usbmodem*" "/dev/cu.usbserial-*")
+        ;;
     --*|compile*)
         # No target specified, treat as flag — default to onjuino
         set -- "$TARGET" "$@"
@@ -32,7 +40,7 @@ case "$TARGET" in
         PORT_GLOBS=("/dev/cu.usbmodem*")
         ;;
     *)
-        echo "Unknown target: $TARGET (expected onjuino or m5_echo)"
+        echo "Unknown target: $TARGET (expected onjuino, m5_echo, or waveshare)"
         exit 1
         ;;
 esac

@@ -261,7 +261,46 @@ _WMO_UZ: dict[int, str] = {
 }
 
 
+# Geocode cache: city name (lowercased) -> geo dict. Pre-seeded with major
+# Uzbek cities so the common weather queries skip the geocoding round-trip
+# entirely (it was ~0.8s of the tool's latency). Learned lookups are added
+# on the fly, so any city is fast on its second query.
+_GEO_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _seed_geo():
+    seed = [
+        ("toshkent", "Tashkent", "Uzbekistan", 41.2995, 69.2401),
+        ("tashkent", "Tashkent", "Uzbekistan", 41.2995, 69.2401),
+        ("samarqand", "Samarkand", "Uzbekistan", 39.6542, 66.9597),
+        ("samarkand", "Samarkand", "Uzbekistan", 39.6542, 66.9597),
+        ("buxoro", "Bukhara", "Uzbekistan", 39.7680, 64.4210),
+        ("andijon", "Andijan", "Uzbekistan", 40.7829, 72.3442),
+        ("namangan", "Namangan", "Uzbekistan", 40.9983, 71.6726),
+        ("farg'ona", "Fergana", "Uzbekistan", 40.3864, 71.7864),
+        ("fargona", "Fergana", "Uzbekistan", 40.3864, 71.7864),
+        ("nukus", "Nukus", "Uzbekistan", 42.4531, 59.6103),
+        ("qarshi", "Qarshi", "Uzbekistan", 38.8606, 65.7891),
+        ("termiz", "Termez", "Uzbekistan", 37.2242, 67.2783),
+        ("xiva", "Khiva", "Uzbekistan", 41.3783, 60.3639),
+        ("urganch", "Urgench", "Uzbekistan", 41.5500, 60.6333),
+        ("jizzax", "Jizzakh", "Uzbekistan", 40.1158, 67.8422),
+        ("navoiy", "Navoiy", "Uzbekistan", 40.0844, 65.3792),
+        ("guliston", "Gulistan", "Uzbekistan", 40.4897, 68.7842),
+    ]
+    for key, name, country, lat, lon in seed:
+        _GEO_CACHE[key] = {"name": name, "country": country,
+                           "lat": lat, "lon": lon, "tz": "auto"}
+
+
+_seed_geo()
+
+
 async def _geocode(client: httpx.AsyncClient, name: str) -> dict[str, Any] | None:
+    key = name.strip().lower()
+    cached = _GEO_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         r = await client.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -273,13 +312,15 @@ async def _geocode(client: httpx.AsyncClient, name: str) -> dict[str, Any] | Non
         if not results:
             return None
         g = results[0]
-        return {
+        geo = {
             "name": g.get("name"),
             "country": g.get("country"),
             "lat": g["latitude"],
             "lon": g["longitude"],
             "tz": g.get("timezone", "auto"),
         }
+        _GEO_CACHE[key] = geo
+        return geo
     except Exception as e:
         log.debug(f"geocode {name!r} failed: {e}")
         return None
@@ -570,6 +611,20 @@ async def telegram_send_message(args: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
+# ─── yoshlar dashboard analytics ───────────────────────────────────────────
+
+async def get_yoshlar_analytics(args: dict[str, Any]) -> dict[str, Any]:
+    """Fetch analytics from the Yoshlar Ishlari Agentligi call-center
+    dashboard (yoshlar.navai.pro). One scope per call; the LLM should pick
+    the most relevant one based on what the user asked."""
+    from pipeline.services import yoshlar
+    scope = (args.get("scope") or "summary").lower().strip()
+    res = await yoshlar.get_analytics(scope)
+    log.info(f"TOOL get_yoshlar_analytics(scope={scope}) -> "
+             f"{'error' if 'error' in res else 'ok'}")
+    return res
+
+
 # ─── set_volume ─────────────────────────────────────────────────────────────
 
 async def set_volume(args: dict[str, Any]) -> dict[str, Any]:
@@ -826,6 +881,50 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "get_yoshlar_analytics": {
+        "type": "function",
+        "function": {
+            "name": "get_yoshlar_analytics",
+            "description": (
+                "Fetch live analytics from the Yoshlar Ishlari Agentligi "
+                "call-center dashboard (yoshlar.navai.pro). Call this when "
+                "the user asks about: dashboard, statistika, qo'ng'iroqlar "
+                "tahlili / qo'ng'iroqlar statistikasi, operatorlar natijasi, "
+                "eng ko'p mavzular, soatlik yuk, FCR, yoshlar agentligi "
+                "natijasi/statistikasi. Note: Uzbek ASR often transcribes "
+                "'dashboard' phonetically — treat ANY of these as a "
+                "dashboard request and call this tool: 'deyshport', "
+                "'deshport', 'deshbord', 'dashbord', 'deshport', "
+                "'deshporta', 'desh port', 'deyshbord'. Pick ONE scope per "
+                "call:\n"
+                "  - 'summary': overall KPIs (total calls, contained rate, "
+                "    transfer rate, avg duration, trend vs last week). "
+                "    Default — use unless user asks for something specific.\n"
+                "  - 'topics': top call topics with counts (Yoshlar Daftari, "
+                "    Psixologik Yordam, etc).\n"
+                "  - 'operators': per-operator call counts (top 5).\n"
+                "  - 'hourly': today's call volume by hour, plus peak hour.\n"
+                "  - 'fcr': first-call resolution rate.\n"
+                "After the tool returns, answer in AT MOST ONE short Uzbek "
+                "sentence with the single most relevant number — this is "
+                "spoken aloud, so brevity matters (long answers take many "
+                "seconds to read). Do NOT list every metric or every "
+                "operator; give the headline figure and, if useful, end with "
+                "a brief 'Batafsil kerakmi?' offer. Spell every number in "
+                "Uzbek words; round percentages to whole numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["summary", "topics", "operators", "hourly", "fcr"],
+                        "description": "Which slice of analytics to fetch. Default 'summary'.",
+                    },
+                },
+            },
+        },
+    },
 }
 
 
@@ -833,6 +932,7 @@ REGISTRY: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "find_timezone": find_timezone,
     "get_kunuz_news": get_kunuz_news,
     "get_weather": get_weather,
+    "get_yoshlar_analytics": get_yoshlar_analytics,
     "play_music": play_music,
     "set_volume": set_volume,
     "stop_music": stop_music,

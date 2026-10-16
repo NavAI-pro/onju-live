@@ -29,6 +29,7 @@ class Device:
         self.led_power = 0
         self.led_update_time = 0.0
         self.vad_writer: asyncio.StreamWriter | None = None  # persistent TCP for LED blinks
+        self.stt_stream = None  # live StreamingSTT session during VAD recording
         # User-facing volume on a 0..100 scale, mutable via the set_volume tool.
         # Default seeded from config.device.default_volume (0..20 firmware scale) × 5.
         self.volume: int = max(0, min(100, int(config["device"].get("default_volume", 15)) * 5))
